@@ -170,8 +170,8 @@ effectively ignored on the forced-local path — only `COGNEE_LOCAL_API_URL` is 
 
 | Command | What it does |
 |---|---|
-| `/cognee` | Status: health + latency, mode, dataset, session, API key source, capture/auto settings, recall hits, queue, breaker, code-graph state |
-| `/cognee-doctor` | Diagnose: mode + why, env file and shell overrides, API key source, reachability + latency + version, dataset list, breaker, timeouts, code graph |
+| `/cognee` | Status: health + latency, mode, dataset, federation state, session, API key source, capture/auto settings, recall hits, queue, breaker, code-graph state |
+| `/cognee-doctor` | Diagnose: mode + why, env file and shell overrides, API key source, reachability + latency + version, dataset list, federation state, breaker, timeouts, code graph |
 | `/cognee-remember <text>` | Store text in the graph. `--file <path>` ingests one file (≤200 KB, text-only) **verbatim under its real filename** — code extensions route down the zero-LLM code-graph path (single file, no cross-file edges; use `/cognee-index` for those). `--node-set user_context\|project_docs\|agent_actions` picks the memory category. Waits briefly for cognify |
 | `/cognee-search <query>` | Explicit graph search. `--top-k N`, `--dataset <name>` |
 | `/cognee-index [path\|git-url]` | Index a repo into the code graph (cognee ≥ 1.5.4). `--dataset <name>`, `--index-vectors` (embed code facts for semantic search), `--wait <seconds>` (poll until queryable). Default dataset `codebase-<repo>-<digest>`, printed on success. Local paths need a server sharing this filesystem (cloud servers reject them — pass a git URL; the command warns) |
@@ -247,7 +247,7 @@ graph recall inside the same recall budget, so it can never add latency beyond i
 |---|---|
 | `cognee_remember(content \| file, node_set?, dataset?)` | The user states a lasting preference, decision, convention, or fact — or asks you to remember something. `file` uploads one file from disk under its real filename (code extensions → zero-LLM code-graph route) |
 | `cognee_recall(query, search_type?, session_only?, top_k?)` | Targeted memory lookup mid-task; `session_only=true` reads this session's raw Q&A cache |
-| `cognee_search(query, top_k?, dataset?, search_type?)` | Broad/exploratory graph search, cross-dataset (incl. memories written by the Claude Code / Codex plugins) |
+| `cognee_search(query, top_k?, dataset?, search_type?)` | Broad/exploratory graph search, cross-dataset (incl. memories written by the Claude Code / Codex plugins; federated reads apply when `COGNEE_PLUGIN_READ_DATASET_IDS` is set) |
 | `cognee_code(seed?, operation?, name?/start?/source?+target?/targets?/kind?/limit?/max_depth?/direction?, repo?, dataset?, top_k?)` | Structural code questions naming a symbol/file: callers of a seed, `impact_analysis` (what breaks if X changes), `find_path` (how A reaches B), `query_facts kind:"route"` (all endpoints), `explore`/`traverse`, `delta` (what the last index changed) — exact, instant, no tokens. Conceptual questions → `cognee_search` |
 | `cognee_forget(dataset, data_id?, entire_dataset?)` | The user explicitly asks to remove wrong/outdated/sensitive memories (irreversible) |
 | `cognee_sync(dataset?)` | The user asks to save this session's memory to the graph |
@@ -288,6 +288,7 @@ passes through `LLM_API_KEY` / `LLM_MODEL` for a local server (reported by `/cog
 | `COGNEE_BACKEND` / `COGNEE_PI_BACKEND` | auto | Pin `local` or `cloud` |
 | `COGNEE_LOCAL_API_URL` | `http://localhost:8011` | Local server URL |
 | `COGNEE_PLUGIN_DATASET` | `agent_sessions` | Graph dataset — set per project for scoped memory; the default is shared with the Claude Code/Codex plugins |
+| `COGNEE_PLUGIN_READ_DATASET_IDS` | — | JSON array of dataset **UUIDs** for federated **graph recall** (read-only federation; see [Federated reads](#federated-reads-cognee_plugin_read_dataset_ids)) |
 | `COGNEE_SESSION_PREFIX` / `COGNEE_SESSION_ID` | `pi` / auto | Cognee session id (`pi_<pi session id>`) |
 | `COGNEE_CAPTURE` | `true` | Master switch for auto-capture + auto-recall |
 | `COGNEE_CONTEXT_MAX_CHARS` | `2000` | Cap for the injected recall block |
@@ -307,6 +308,39 @@ passes through `LLM_API_KEY` / `LLM_MODEL` for a local server (reported by `/cog
 | `COGNEE_CODE_AUTOINDEX` | `auto` | Code-graph auto-indexing of new repos: `auto` (loopback server only), `always` (any server), `off`. `COGNEE_CAPTURE=false` disables it as part of all automation |
 | `COGNEE_CODE_INDEX_TIMEOUT_MS` | `120000` | Repo-index submit timeout (background pipelines confirm slowly; a timeout is not retried blindly — the submission may have landed) |
 
+### Federated reads (`COGNEE_PLUGIN_READ_DATASET_IDS`)
+
+Set `COGNEE_PLUGIN_READ_DATASET_IDS` to a JSON array of dataset **UUIDs** to widen **graph
+recall** across datasets you granted yourself — the same read-only federation the official
+plugins ship (shell export or `~/.cognee/.env`, shell wins):
+
+```bash
+COGNEE_PLUGIN_READ_DATASET_IDS='["3f2b8ac6-1d5e-4f7a-9c3b-2e8d7a6b5c4f", "01234567-89ab-cdef-0123-456789abcdef"]'
+```
+
+Find dataset UUIDs with `/cognee-forget` (it lists datasets with their ids) or the server UI.
+
+- **Graph reads only.** Auto-recall per prompt, `/cognee-search`, `cognee_recall` /
+  `cognee_search`, and the pre-compact anchor recall address the read set by UUID
+  (`dataset_ids`) — the federated payload drops both the dataset name and the session
+  binding ("session history remains bound to ONE dataset; federated graph recall is a
+  separate read"). Writes, `/cognee-sync`, and session-cache memory **never federate**:
+  they always target the single session dataset.
+- **Precedence.** The env read set beats an explicit `dataset` / `--dataset` argument on the
+  graph lane and beats UUID addressing passed per call; the code lane (`cognee_code`,
+  `scope=["code"]`) is never federated.
+- **UUID-only.** Entries must be UUIDs (hyphens optional, case-insensitive); they are
+  canonicalized to lowercase-hyphenated form and deduped preserving first-seen order. A
+  malformed value (non-JSON, non-list, empty list, non-UUID entry) disables federation and
+  surfaces the exact validation error — as a load-time config warning in `/cognee` and
+  `/cognee-doctor` plus a one-time session-start notice, never a crash (the reference
+  raises the same strings at recall time).
+- **Cross-agent caution.** The variable only *selects among* datasets your API key can
+  already read — server-side RBAC is still enforced, and a UUID you have no read grant on
+  simply fails recall (`DatasetNotFoundError`). Grants flow child→parent only: your user
+  sees what the agent writes, but the agent sees nothing your user (or another plugin's
+  agent) owns. Use dataset UUIDs for shared read targets; never as a way to widen writes.
+
 ## Parity with the Claude Code / Codex cognee plugins
 
 | Feature | Claude Code / Codex | pi-cognee |
@@ -318,6 +352,7 @@ passes through `LLM_API_KEY` / `LLM_MODEL` for a local server (reported by `/cog
 | Secret redaction + size limits before capture | ✅ | ✅ text-level |
 | Config: `~/.cognee/.env` shared file, shell > file, `COGNEE_BACKEND` pinning | ✅ | ✅ |
 | Shared default dataset `agent_sessions` (cross-agent memory) | ✅ | ✅ |
+| Federated graph recall (`COGNEE_PLUGIN_READ_DATASET_IDS` — JSON UUID array; `dataset_ids`-only payload that drops the session binding; env read set beats explicit datasets; code lane and writes never federate) | ✅ | ✅ same semantics, exact reference error strings (surfaced as a load-time config warning instead of a recall-time raise) |
 | Explicit remember with node_sets + background cognify wait | ✅ | ✅ |
 | Forget (doc / whole dataset, irreversible, confirmed, data-item discovery) | ✅ | ✅ |
 | Manual sync skill/command | ✅ | ✅ `/cognee-sync` + `cognee_sync` |

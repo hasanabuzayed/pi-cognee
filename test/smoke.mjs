@@ -257,6 +257,243 @@ await check("sanitizeDatasetName / sanitizeSessionId keep the cognee charset", (
   assert.equal(clientMod.sanitizeSessionId("pi_abc ✨"), "pi_abc--");
 });
 
+/* ---------- federated read datasets (COGNEE_PLUGIN_READ_DATASET_IDS) ---------- */
+
+await check("parseReadDatasetIds: valid JSON UUID list parses, canonicalizes, dedupes (first-seen order)", () => {
+  const r = clientMod.parseReadDatasetIds(
+    JSON.stringify([
+      "3F2B8AC6-1D5E-4F7A-9C3B-2E8D7A6B5C4F", // uppercase → canonicalized lowercase
+      "3f2b8ac6-1d5e-4f7a-9c3b-2e8d7a6b5c4f", // duplicate AFTER canonicalization → deduped
+      "0123456789abcdef0123456789abcdef", // hyphenless → hyphenated
+      "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    ]),
+  );
+  assert.deepEqual(r.datasetIds, [
+    "3f2b8ac6-1d5e-4f7a-9c3b-2e8d7a6b5c4f",
+    "01234567-89ab-cdef-0123-456789abcdef",
+    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+  ]);
+  assert.equal(r.error, undefined, "valid list carries no error");
+  assert.equal(clientMod.parseReadDatasetIds("   ").datasetIds, undefined, "blank → no federation");
+  assert.equal(clientMod.parseReadDatasetIds(undefined).datasetIds, undefined, "unset → no federation");
+});
+
+await check("parseReadDatasetIds: exact reference error strings for invalid JSON / non-list / empty / non-UUID", () => {
+  const badJson = clientMod.parseReadDatasetIds("[not json");
+  assert.ok(
+    typeof badJson.error === "string" &&
+      badJson.error.startsWith("COGNEE_PLUGIN_READ_DATASET_IDS is not valid JSON: "),
+    `invalid JSON error prefix (parser detail appended verbatim): ${badJson.error}`,
+  );
+  assert.equal(badJson.datasetIds, undefined, "invalid JSON → federation off");
+  const shape = "COGNEE_PLUGIN_READ_DATASET_IDS must be a nonempty JSON list of UUIDs";
+  assert.equal(clientMod.parseReadDatasetIds('"a-string"').error, shape, "JSON non-list");
+  assert.equal(clientMod.parseReadDatasetIds("[]").error, shape, "empty list");
+  assert.equal(clientMod.parseReadDatasetIds('["agent_sessions"]').error, shape, "dataset NAME is not a UUID");
+  assert.equal(
+    clientMod.parseReadDatasetIds('["3f2b8ac6-1d5e-4f7a-9c3b-2e8d7a6b5c4f", 42]').error,
+    shape,
+    "non-UUID entry",
+  );
+  assert.equal(clientMod.parseReadDatasetIds("5").error, shape, "JSON scalar is not a list");
+});
+
+await check("loadCogneeConfig: COGNEE_PLUGIN_READ_DATASET_IDS parsed with shell > env-file precedence, error surfaced", async () => {
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const os = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync(join(os.tmpdir(), "pi-cognee-fed-"));
+  const envFile = join(dir, ".env");
+  const A = "3f2b8ac6-1d5e-4f7a-9c3b-2e8d7a6b5c4f";
+  const B = "01234567-89ab-cdef-0123-456789abcdef";
+  writeFileSync(envFile, `COGNEE_PLUGIN_READ_DATASET_IDS=["${A}"]\n`, "utf8");
+  const keys = ["COGNEE_PLUGIN_READ_DATASET_IDS", "COGNEE_ENV_FILE"];
+  const saved = keys.map((k) => process.env[k]);
+  try {
+    process.env.COGNEE_ENV_FILE = envFile;
+    delete process.env.COGNEE_PLUGIN_READ_DATASET_IDS;
+    let cfg = clientMod.loadCogneeConfig();
+    assert.deepEqual(cfg.readDatasetIds, [A], "env-file value parsed");
+    assert.equal(cfg.readDatasetIdsSource, "env file", "source labeled env file");
+    assert.equal(cfg.readDatasetIdsError, undefined, "valid list → no error");
+
+    process.env.COGNEE_PLUGIN_READ_DATASET_IDS = `["${B}"]`;
+    cfg = clientMod.loadCogneeConfig();
+    assert.deepEqual(cfg.readDatasetIds, [B], "shell export beats the env file");
+    assert.equal(cfg.readDatasetIdsSource, "shell env", "source labeled shell env");
+
+    process.env.COGNEE_PLUGIN_READ_DATASET_IDS = "[]";
+    cfg = clientMod.loadCogneeConfig();
+    assert.equal(cfg.readDatasetIds, undefined, "invalid value → federation off, no crash");
+    assert.equal(
+      cfg.readDatasetIdsError,
+      "COGNEE_PLUGIN_READ_DATASET_IDS must be a nonempty JSON list of UUIDs",
+      "exact reference error surfaced at load",
+    );
+  } finally {
+    keys.forEach((k, i) => {
+      if (saved[i] === undefined) delete process.env[k];
+      else process.env[k] = saved[i];
+    });
+  }
+});
+
+await check("federated recall wire payload: dataset_ids only (no session_id/datasets); code lane + writes never federate", async () => {
+  const realFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, opts) => {
+    const body =
+      typeof opts?.body === "string"
+        ? JSON.parse(opts.body)
+        : opts?.body instanceof FormData
+          ? opts.body
+          : null;
+    calls.push({ url: String(url), body });
+    return { ok: true, status: 200, text: async () => "[]" };
+  };
+  try {
+    const base = clientMod.loadCogneeConfig();
+    const federated = new clientMod.CogneeClient({
+      ...base,
+      baseUrl: "https://cognee.invalid",
+      apiKey: "smoke-key",
+      dataset: "agent_sessions",
+      readDatasetIds: ["3f2b8ac6-1d5e-4f7a-9c3b-2e8d7a6b5c4f", "01234567-89ab-cdef-0123-456789abcdef"],
+      readDatasetIdsSource: "shell env",
+    });
+    // Graph-lane recall: federated — dataset name AND session binding dropped.
+    await federated.recall({ query: "q", sessionId: "pi_s", dataset: "agent_sessions", scope: ["graph"] });
+    // Explicit dataset_ids param LOSES to the env federation (reference precedence).
+    await federated.recall({ query: "q", datasetIds: ["ffffffff-ffff-ffff-ffff-ffffffffffff"], scope: ["graph"] });
+    // Code lane: never federated — name addressing kept.
+    await federated.codeSearch({ seed: "process_payment", dataset: "codebase-x-0123abcd" });
+    // Writes never consult the federation config: still the own dataset.
+    await federated.rememberEntry({ type: "qa", question: "q", answer: "a" }, "pi_s", "agent_sessions");
+    await federated.improve("pi_s", "agent_sessions");
+
+    const recalls = calls.filter((c) => c.url.endsWith("/api/v1/recall"));
+    assert.equal(recalls.length, 3, "three recall calls");
+    const [fed, explicitIds, code] = recalls.map((c) => c.body);
+    for (const key of ["session_id", "sessionId", "datasets"]) {
+      assert.equal(key in fed, false, `federated recall carries no ${key}`);
+    }
+    assert.deepEqual(
+      fed.dataset_ids,
+      ["3f2b8ac6-1d5e-4f7a-9c3b-2e8d7a6b5c4f", "01234567-89ab-cdef-0123-456789abcdef"],
+      "federated dataset_ids = the configured read set",
+    );
+    assert.deepEqual(fed.datasetIds, fed.dataset_ids, "camelCase twin sent for the 1.6.0 RecallPayloadDTO");
+    assert.equal(fed.top_k, 5, "snake_case top_k kept for ≤1.5 servers");
+    assert.equal(fed.topK, 5, "camelCase topK added for 1.6.0");
+    assert.equal(fed.onlyContext, true, "camelCase onlyContext added (1.6.0 default flips to false)");
+    assert.deepEqual(explicitIds.dataset_ids, fed.dataset_ids, "env federation beats an explicit datasetIds param");
+    assert.equal(code.datasets[0], "codebase-x-0123abcd", "code lane keeps name addressing");
+    assert.equal(code.dataset_ids, undefined, "code lane never federates");
+
+    const entry = calls.find((c) => c.url.endsWith("/api/v1/remember/entry"))?.body;
+    assert.ok(entry, "remember/entry write captured");
+    assert.equal(entry.dataset_name, "agent_sessions", "session-cache write still targets the own dataset name");
+    assert.equal(entry.session_id, "pi_s", "session-cache write keeps its session binding");
+    assert.ok(!("dataset_id" in entry) && !("dataset_ids" in entry), "write never federates");
+
+    const improveBody = calls.find((c) => c.url.endsWith("/api/v1/improve"))?.body;
+    assert.ok(improveBody, "improve call captured");
+    assert.deepEqual(improveBody.sessionIds, ["pi_s"], "improve camelCase sessionIds (1.6.0)");
+    assert.deepEqual(improveBody.session_ids, ["pi_s"], "improve snake_case twin kept (≤1.5)");
+    assert.equal(improveBody.runInBackground, true, "improve camelCase runInBackground (1.6.0)");
+    assert.equal(improveBody.datasetName, "agent_sessions", "improve camelCase datasetName (1.6.0)");
+    assert.equal(improveBody.dataset_name, "agent_sessions", "improve snake_case twin kept (≤1.5)");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await check("UUID-shaped dataset promoted to UUID addressing in recall()/remember() (reference parity)", async () => {
+  const realFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, opts) => {
+    const body =
+      typeof opts?.body === "string"
+        ? JSON.parse(opts.body)
+        : opts?.body instanceof FormData
+          ? opts.body
+          : null;
+    calls.push({ url: String(url), body });
+    return { ok: true, status: 200, text: async () => "[]" };
+  };
+  try {
+    const base = clientMod.loadCogneeConfig();
+    const c = new clientMod.CogneeClient({
+      ...base,
+      baseUrl: "https://cognee.invalid",
+      apiKey: "smoke-key",
+      readDatasetIds: undefined, // unfederated: the dataset param takes addressing
+    });
+    // recall: uppercase-hyphenated, hyphenless, and plain-name addressing
+    await c.recall({ query: "q", sessionId: "pi_s", dataset: "3F2B8AC6-1D5E-4F7A-9C3B-2E8D7A6B5C4F", scope: ["graph"] });
+    await c.recall({ query: "q", dataset: "0123456789abcdef0123456789abcdef", scope: ["graph"] });
+    await c.recall({ query: "q", sessionId: "pi_s", dataset: "agent_sessions", scope: ["graph"] });
+    // remember: multipart form targets datasetId vs datasetName
+    await c.remember({ content: "x", dataset: "3F2B8AC6-1D5E-4F7A-9C3B-2E8D7A6B5C4F" });
+    await c.remember({ content: "x", dataset: "agent_sessions" });
+
+    const recalls = calls.filter((x) => x.url.endsWith("/api/v1/recall"));
+    assert.equal(recalls.length, 3, "three recall calls");
+    const [upper, hyphenless, byName] = recalls.map((x) => x.body);
+    assert.deepEqual(
+      upper.dataset_ids,
+      ["3f2b8ac6-1d5e-4f7a-9c3b-2e8d7a6b5c4f"],
+      "UUID-shaped dataset (uppercase) → canonical lowercase dataset_ids",
+    );
+    assert.deepEqual(upper.datasetIds, upper.dataset_ids, "camelCase twin sent for the 1.6.0 RecallPayloadDTO");
+    assert.ok(!("datasets" in upper), "UUID addressing carries no datasets name");
+    assert.equal(upper.session_id, "pi_s", "session binding stays attached outside federation (reference parity)");
+    assert.deepEqual(
+      hyphenless.dataset_ids,
+      ["01234567-89ab-cdef-0123-456789abcdef"],
+      "hyphenless UUID canonicalized to hyphenated dataset_ids",
+    );
+    assert.equal(hyphenless.session_id, undefined, "no session binding to drop when none given");
+    assert.deepEqual(byName.datasets, ["agent_sessions"], "plain name keeps datasets addressing");
+    assert.equal(byName.dataset_ids, undefined, "plain name never sends dataset_ids");
+    assert.equal(byName.session_id, "pi_s", "plain-name recall keeps its session binding");
+
+    const forms = calls.filter((x) => x.url.endsWith("/api/v1/remember") && x.body instanceof FormData);
+    assert.equal(forms.length, 2, "two remember calls captured");
+    assert.equal(forms[0].body.get("datasetId"), "3f2b8ac6-1d5e-4f7a-9c3b-2e8d7a6b5c4f", "UUID-shaped dataset → datasetId form field (canonicalized)");
+    assert.equal(forms[0].body.get("datasetName"), null, "UUID addressing sends no datasetName");
+    assert.equal(forms[1].body.get("datasetName"), "agent_sessions", "plain name → datasetName form field");
+    assert.equal(forms[1].body.get("datasetId"), null, "plain name sends no datasetId");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await check("read-tool descriptions mention federated reads when COGNEE_PLUGIN_READ_DATASET_IDS is set", () => {
+  const saved = process.env.COGNEE_PLUGIN_READ_DATASET_IDS;
+  try {
+    process.env.COGNEE_PLUGIN_READ_DATASET_IDS = JSON.stringify(["3f2b8ac6-1d5e-4f7a-9c3b-2e8d7a6b5c4f"]);
+    const { pi: piFed, recorded: recFed } = makeStubApi();
+    factory(piFed); // side-effect-free factory: no timers until session_start
+    for (const name of ["cognee_recall", "cognee_search"]) {
+      const tool = recFed.tools.find((t) => t.name === name);
+      assert.ok(tool, `${name} registered`);
+      assert.ok(
+        tool.description.includes("Federated reads are configured"),
+        `${name} description mentions federated reads when configured`,
+      );
+    }
+    const codeTool = recFed.tools.find((t) => t.name === "cognee_code");
+    assert.ok(
+      !codeTool.description.includes("Federated reads are configured"),
+      "code lane (never federated) carries no federation note",
+    );
+  } finally {
+    if (saved === undefined) delete process.env.COGNEE_PLUGIN_READ_DATASET_IDS;
+    else process.env.COGNEE_PLUGIN_READ_DATASET_IDS = saved;
+  }
+});
+
 await check("forget discovery guidance + data-item client methods exist", () => {
   const forget = recorded.tools.find((t) => t.name === "cognee_forget");
   assert.ok(forget, "cognee_forget tool registered");

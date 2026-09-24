@@ -184,6 +184,13 @@ export interface CogneeConfig {
   shellOverrides: string[];
   /** Default dataset (graph tier). `agent_sessions` is shared with the official plugins. */
   dataset: string;
+  /** Federated graph-recall read set (COGNEE_PLUGIN_READ_DATASET_IDS — JSON array of
+   *  UUIDs, read-only federation; writes never consult it). */
+  readDatasetIds?: string[];
+  /** Where the read set came from (shell exports beat the env file). */
+  readDatasetIdsSource?: "shell env" | "env file";
+  /** Exact reference validation error when the var is set but malformed (federation off). */
+  readDatasetIdsError?: string;
   sessionIdOverride?: string;
   sessionPrefix: string;
   /** Master switch for automatic capture + auto-recall (explicit tools always work). */
@@ -236,6 +243,49 @@ function autoindexMode(effective: EnvLookup): "auto" | "always" | "off" {
   if (["off", "0", "false", "no"].includes(value)) return "off";
   if (["always", "1", "true", "yes", "on"].includes(value)) return "always";
   return "auto";
+}
+
+/* ------------------------------------------------------------------ */
+/* Federated read datasets (COGNEE_PLUGIN_READ_DATASET_IDS)            */
+/* Mirrors reference _dataset_access.py recall_fields' env lane.       */
+/* ------------------------------------------------------------------ */
+
+export interface ReadDatasetIdsResult {
+  /** Canonical UUIDs, deduped preserving first-seen order; absent when unset/blank/invalid. */
+  datasetIds?: string[];
+  /** Exact reference error string when the value is present but malformed. */
+  error?: string;
+}
+
+/**
+ * COGNEE_PLUGIN_READ_DATASET_IDS — a JSON array of dataset UUIDs that widens
+ * GRAPH recall (read-only federation; writes never consult it). Parsing mirrors
+ * the reference field-for-field: unset or whitespace-only → off; invalid JSON →
+ * the exact error with the parser's message appended verbatim; non-list / empty
+ * list / any non-UUID entry → the exact shape error; entries canonicalized via
+ * dataset_id (hyphens optional, case-insensitive) then deduped preserving
+ * first-seen order (dict.fromkeys). The reference raises these errors at recall
+ * time; pi-cognee surfaces the same exact strings at config load instead —
+ * fail-soft: a bad value disables federation, it never crashes the recall path.
+ */
+export function parseReadDatasetIds(raw: string | undefined): ReadDatasetIdsResult {
+  const trimmed = (raw ?? "").trim();
+  if (!trimmed) return {}; // unset or whitespace-only → no federation
+  let values: unknown;
+  try {
+    values = JSON.parse(trimmed);
+  } catch (err) {
+    return { error: `COGNEE_PLUGIN_READ_DATASET_IDS is not valid JSON: ${describeError(err)}` };
+  }
+  if (
+    !Array.isArray(values) ||
+    values.length === 0 ||
+    !values.every((v) => canonicalUuid(v) !== "")
+  ) {
+    return { error: "COGNEE_PLUGIN_READ_DATASET_IDS must be a nonempty JSON list of UUIDs" };
+  }
+  // Dedupe AFTER canonicalization, first-seen order preserved (dict.fromkeys).
+  return { datasetIds: [...new Set(values.map((v) => canonicalUuid(v)))] };
 }
 
 export function loadCogneeConfig(): CogneeConfig {
@@ -291,6 +341,13 @@ export function loadCogneeConfig(): CogneeConfig {
     ),
   ].sort();
 
+  // Federated read set (COGNEE_PLUGIN_READ_DATASET_IDS): shell > env file, same
+  // precedence as every other key. Malformed values surface the exact reference
+  // error at load (config warning) and disable federation — never a crash.
+  const readDatasetParsed = parseReadDatasetIds(effective("COGNEE_PLUGIN_READ_DATASET_IDS"));
+  const readDatasetIdsSource: "shell env" | "env file" =
+    process.env.COGNEE_PLUGIN_READ_DATASET_IDS !== undefined ? "shell env" : "env file";
+
   return {
     backend,
     backendForced,
@@ -305,6 +362,9 @@ export function loadCogneeConfig(): CogneeConfig {
     envFileKeys,
     shellOverrides,
     dataset: sanitizeDatasetName(effective("COGNEE_PLUGIN_DATASET") || "agent_sessions"),
+    readDatasetIds: readDatasetParsed.datasetIds,
+    readDatasetIdsSource: readDatasetParsed.datasetIds ? readDatasetIdsSource : undefined,
+    readDatasetIdsError: readDatasetParsed.error,
     sessionIdOverride: effective("COGNEE_SESSION_ID") || undefined,
     sessionPrefix: effective("COGNEE_SESSION_PREFIX") || "pi",
     capture: bool(effective, "COGNEE_CAPTURE", true),
@@ -337,6 +397,34 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 export function isUuid(value: string): boolean {
   return UUID_RE.test(value);
+}
+
+const UUID32_RE = /^[0-9a-f]{32}$/i;
+
+/**
+ * `dataset_id(value)` from the reference `_dataset_access.py`, verbatim semantics:
+ * `str(UUID(str(value)))` — accepts UUIDs with or without hyphens, case-insensitively,
+ * canonicalizes to the lowercase-hyphenated form, and returns "" for anything else
+ * ("Dataset UUIDs are authoritative; names are only for owned datasets.").
+ * Unlike Python's UUID constructor, brace-wrapped (`{…}`) and URN (`urn:uuid:…`)
+ * forms are not accepted — practically irrelevant for the JSON env array and the
+ * dataset arguments this feeds.
+ */
+export function canonicalUuid(value: unknown): string {
+  const raw = typeof value === "string" ? value : String(value ?? "");
+  if (UUID_RE.test(raw)) return raw.toLowerCase();
+  if (UUID32_RE.test(raw)) {
+    return [
+      raw.slice(0, 8),
+      raw.slice(8, 12),
+      raw.slice(12, 16),
+      raw.slice(16, 20),
+      raw.slice(20, 32),
+    ]
+      .join("-")
+      .toLowerCase();
+  }
+  return "";
 }
 
 export function sanitizeDatasetName(name: string): string {
@@ -869,7 +957,6 @@ export interface QaEntry {
   question: string;
   answer: string;
   context?: string;
-  node_set?: string;
 }
 
 export interface RememberParams {
@@ -1193,27 +1280,71 @@ export class CogneeClient {
   }
 
   /**
-   * POST /api/v1/recall. Dataset addressing: UUID → dataset_ids (drops session_id),
-   * plain name → datasets, neither → server default. 404 on graph scope = authoritative
-   * empty (no graph yet) and is returned as ok with noGraph=true.
+   * POST /api/v1/recall. Dataset addressing mirrors _dataset_access.py
+   * recall_fields(): a UUID-shaped dataset value → dataset_ids (canonicalized —
+   * "Dataset UUIDs are authoritative; names are only for owned datasets"), a
+   * plain name → datasets, neither → server default. The session binding stays
+   * attached outside the federated path (only federation drops it, like the
+   * reference). 404 on graph scope = authoritative empty (no graph yet) and is
+   * returned as ok with noGraph=true.
+   *
+   * Federation (research/federation-brief.md, mirroring _dataset_access.py):
+   * on an EXACT ["graph"] scope with COGNEE_PLUGIN_READ_DATASET_IDS configured, the
+   * payload addresses the federated read set via dataset_ids ONLY — dataset/datasets
+   * and session_id are dropped ("session history remains bound to ONE dataset.
+   * Federated graph recall is a separate read"). Precedence: env federation >
+   * explicit datasetIds > dataset name; the code lane (scope=["code"]) never
+   * federates. Writes never consult the federation config.
+   *
+   * Renamed body keys are dual-spelled (snake_case for cognee ≤ 1.5.x, camelCase per
+   * the 1.6.0 RecallPayloadDTO schema) — each server version reads the spelling it
+   * knows and ignores the other; query/scope/datasets never changed casing.
    */
   async recall(params: RecallParams): Promise<RecallResult> {
     const scope = params.scope ?? ["graph"];
+    const topK = Math.max(1, params.topK ?? 5);
+    const onlyContext = params.onlyContext ?? true;
     const body: Record<string, unknown> = {
       query: params.query,
-      top_k: Math.max(1, params.topK ?? 5),
-      only_context: params.onlyContext ?? true,
+      top_k: topK,
+      topK,
+      only_context: onlyContext,
+      onlyContext,
       scope,
     };
-    if (params.searchType) body.search_type = params.searchType;
-    if (params.datasetIds?.length) {
-      body.dataset_ids = params.datasetIds;
-    } else {
-      if (params.dataset)
-        body.datasets = [params.datasetPresanitized ? params.dataset : sanitizeDatasetName(params.dataset)];
-      if (params.sessionId) body.session_id = params.sessionId;
+    if (params.searchType) {
+      body.search_type = params.searchType;
+      body.searchType = params.searchType;
     }
-    if (params.codeQuery && scope.includes("code")) body.code_query = params.codeQuery;
+    // Exact ["graph"]-scope gate only — any other scope (e.g. ["graph","session"],
+    // ["code"]) keeps normal name addressing and the session binding.
+    const graphOnly = scope.length === 1 && scope[0] === "graph";
+    if (graphOnly && this.cfg.readDatasetIds?.length) {
+      body.dataset_ids = this.cfg.readDatasetIds;
+      body.datasetIds = this.cfg.readDatasetIds;
+    } else if (params.datasetIds?.length) {
+      body.dataset_ids = params.datasetIds;
+      body.datasetIds = params.datasetIds;
+    } else {
+      // Reference recall_fields(): a UUID-shaped dataset value is authoritative —
+      // address dataset_ids (canonicalized); a plain name addresses datasets. The
+      // session binding stays attached in both cases (only federation drops it).
+      const ident = canonicalUuid(params.dataset);
+      if (ident) {
+        body.dataset_ids = [ident];
+        body.datasetIds = [ident];
+      } else if (params.dataset) {
+        body.datasets = [params.datasetPresanitized ? params.dataset : sanitizeDatasetName(params.dataset)];
+      }
+      if (params.sessionId) {
+        body.session_id = params.sessionId;
+        body.sessionId = params.sessionId;
+      }
+    }
+    if (params.codeQuery && scope.includes("code")) {
+      body.code_query = params.codeQuery;
+      body.codeQuery = params.codeQuery;
+    }
 
     const r = await this.jsonRequest<unknown>("POST", "/api/v1/recall", {
       json: body,
@@ -1247,7 +1378,14 @@ export class CogneeClient {
       form.set("node_set", params.nodeSet ?? "user_context");
       form.set("run_in_background", String(params.background ?? this.cfg.rememberBackground));
       if (params.datasetId) form.set("datasetId", params.datasetId);
-      else if (params.dataset) form.set("datasetName", sanitizeDatasetName(params.dataset));
+      else if (params.dataset) {
+        // Reference write_fields(): a UUID-shaped dataset value addresses
+        // datasetId (canonicalized — UUIDs are authoritative), a plain name
+        // addresses datasetName.
+        const ident = canonicalUuid(params.dataset);
+        if (ident) form.set("datasetId", ident);
+        else form.set("datasetName", sanitizeDatasetName(params.dataset));
+      }
       const filename =
         params.filename ?? `pi-memory-${new Date().toISOString().replace(/[:.]/g, "-")}.txt`;
       form.set("data", new Blob([params.content], { type: "text/plain" }), filename);
@@ -1439,8 +1577,11 @@ export class CogneeClient {
 
   /**
    * POST /api/v1/improve — promotes the server-side session cache into the permanent graph.
-   * Empty-object response = per-session improve lock held (busy, never retried);
-   * 404/405/422 = improve_unsupported.
+   * cognee 1.6.0 answers with a typed ImproveResult whose REQUIRED status enum maps to
+   * outcomes: running → busy, errored → error, completed/skipped → ok. The legacy
+   * pre-1.6 signals stay honored: empty-object body = per-session improve lock held
+   * (busy, never retried); 404/405/422 = improve_unsupported. Body keys are
+   * dual-spelled (snake_case ≤ 1.5.x, camelCase per ImprovePayloadDTO in 1.6.0).
    */
   async improve(
     sessionId: string,
@@ -1448,10 +1589,21 @@ export class CogneeClient {
     timeoutMs: number = this.cfg.improveSubmitTimeoutMs,
     externalSignal?: AbortSignal,
   ): Promise<{ outcome: ImproveOutcome; error?: CogneeError }> {
-    const body: Record<string, unknown> = { session_ids: [sessionId], run_in_background: true };
+    const body: Record<string, unknown> = {
+      session_ids: [sessionId],
+      sessionIds: [sessionId],
+      run_in_background: true,
+      runInBackground: true,
+    };
     if (dataset) {
-      if (isUuid(dataset)) body.dataset_id = dataset;
-      else body.dataset_name = sanitizeDatasetName(dataset);
+      if (isUuid(dataset)) {
+        body.dataset_id = dataset;
+        body.datasetId = dataset;
+      } else {
+        const name = sanitizeDatasetName(dataset);
+        body.dataset_name = name;
+        body.datasetName = name;
+      }
     }
     const r = await this.jsonRequest<unknown>("POST", "/api/v1/improve", {
       json: body,
@@ -1466,13 +1618,16 @@ export class CogneeClient {
       return { outcome: "error", error: r.error };
     }
     const data = r.data;
-    if (
-      data &&
-      typeof data === "object" &&
-      !Array.isArray(data) &&
-      Object.keys(data as object).length === 0
-    ) {
-      return { outcome: "busy" };
+    if (data && typeof data === "object" && !Array.isArray(data)) {
+      const result = data as { status?: unknown; error?: unknown };
+      if (result.status === "running") return { outcome: "busy" };
+      if (result.status === "errored") {
+        const detail = typeof result.error === "string" && result.error ? result.error : "pipeline errored";
+        return { outcome: "error", error: new CogneeError(`improve errored: ${detail}`) };
+      }
+      if (result.status === "completed" || result.status === "skipped") return { outcome: "ok" };
+      // Unknown or absent status: pre-1.6 untyped body — keep the legacy signals.
+      if (Object.keys(result).length === 0) return { outcome: "busy" };
     }
     return { outcome: "ok" };
   }
@@ -1532,7 +1687,13 @@ export class CogneeClient {
       .map((d) => ({
         id: String(d.id ?? d.data_id ?? ""),
         name: typeof d.name === "string" ? d.name : undefined,
-        created_at: typeof d.created_at === "string" ? d.created_at : undefined,
+        // 1.6.0 renamed created_at → createdAt in DataDTO; probe both spellings.
+        created_at:
+          typeof d.created_at === "string"
+            ? d.created_at
+            : typeof d.createdAt === "string"
+              ? d.createdAt
+              : undefined,
       }))
       .filter((d) => d.id);
     return { ok: true, items };

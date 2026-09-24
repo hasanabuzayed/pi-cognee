@@ -208,6 +208,15 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
   const cfg: CogneeConfig = loadCogneeConfig();
   const client = new CogneeClient(cfg);
 
+  /** Suffix for graph-read tool descriptions when federated reads are configured
+   *  (the reference teaches the model about the widened read set only when set). */
+  const federatedReadNote = cfg.readDatasetIds?.length
+    ? ` Federated reads are configured (COGNEE_PLUGIN_READ_DATASET_IDS): graph recall searches ` +
+      `${cfg.readDatasetIds.length} dataset${cfg.readDatasetIds.length === 1 ? "" : "s"} by UUID — ` +
+      "read-only federation; an explicit dataset argument cannot narrow it; writes and session " +
+      "memory stay on the session dataset."
+    : "";
+
   const state = {
     stopped: false,
     healthy: false,
@@ -274,6 +283,22 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
       const repo = state.cwd ? findIndexedRepo(state.cwd) : undefined;
       const when = repo?.last_index_at ? ` · indexed ${new Date(repo.last_index_at).toLocaleTimeString()}` : "";
       return `autoindex ${cfg.codeAutoindex}${repo?.dataset ? ` · ${repo.dataset} (${repo.spec_kind})${when}` : " · no indexed repo for cwd"}`;
+    } catch {
+      return "unavailable";
+    }
+  }
+
+  /** Federation state for /cognee and /cognee-doctor: count + source, or the exact
+   *  validation error (config warning surfaced at load — never a crash). */
+  function federationStatusLine(): string {
+    try {
+      if (cfg.readDatasetIdsError) {
+        return `✕ ${cfg.readDatasetIdsError} — federation off, graph reads stay on '${state.dataset}'`;
+      }
+      const ids = cfg.readDatasetIds ?? [];
+      return ids.length
+        ? `${ids.length} read dataset${ids.length === 1 ? "" : "s"} via COGNEE_PLUGIN_READ_DATASET_IDS (${cfg.readDatasetIdsSource}) — graph reads only; writes stay on '${state.dataset}'`
+        : "off (set COGNEE_PLUGIN_READ_DATASET_IDS to federate graph recall)";
     } catch {
       return "unavailable";
     }
@@ -891,7 +916,7 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
       "refers to earlier decisions/preferences ('like last time', 'as we decided'), or to check what is " +
       "already known about a topic before re-deriving it. Auto-recall already runs on each user prompt; " +
       "use this for targeted follow-up queries. Set session_only=true to read this session's raw cache " +
-      "(recent question/answer pairs) instead of the graph. Output is truncated at 4000 chars.",
+      "(recent question/answer pairs) instead of the graph. Output is truncated at 4000 chars." + federatedReadNote,
     promptSnippet: "Recall previously stored cognee memories relevant to a query.",
     parameters: Type.Object({
       query: Type.String({ description: "What to remember — a natural-language query." }),
@@ -956,7 +981,7 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
       "any dataset by name — including datasets written by the Claude Code or Codex cognee plugins. " +
       "WHEN to use: broad or exploratory memory queries ('what do we know about the billing service'), " +
       "cross-project lookups, or when the user explicitly asks to search memory. " +
-      "Output is truncated at 4000 chars.",
+      "Output is truncated at 4000 chars." + federatedReadNote,
     promptSnippet: "Search cognee memory datasets (graph search, any dataset).",
     parameters: Type.Object({
       query: Type.String({ description: "Natural-language search query." }),
@@ -1228,6 +1253,7 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           `  Mode:      ${cfg.backend}${cfg.backendForced ? ` (forced by COGNEE_BACKEND=${cfg.backend})` : ""}${cfg.missingBaseUrl ? " — ✕ COGNEE_BASE_URL missing" : ""}`,
           `  Server:    ${cfg.baseUrl}${health.reachable ? ` — reachable in ${health.latencyMs}ms${health.version ? ` (v${health.version})` : ""}` : ` — unreachable: ${health.error ?? "unknown error"}`}`,
           `  Dataset:   ${state.dataset}`,
+          `  Federation: ${federationStatusLine()}`,
           `  Session:   ${state.sessionId || "(not started)"}`,
           `  API key:   ${client.authSummary()}`,
           `  Auto:      capture ${cfg.capture ? "on" : "off (COGNEE_CAPTURE=false)"} · auto-recall ${cfg.capture ? "on" : "off"} · auto-sync every ${cfg.autoImproveEvery || "∞"} writes`,
@@ -1263,6 +1289,7 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           `  ${pad("Shell env")}${cfg.shellOverrides.length ? cfg.shellOverrides.join(", ") : "(no COGNEE_*/LLM_* overrides)"}`,
           `  ${pad("LLM_API_KEY")}${cfg.llmApiKeyConfigured ? `configured${cfg.llmModel ? ` (model ${cfg.llmModel})` : ""} — required by a local cognee server` : "missing — required in local mode (the server, not this extension, needs it)"}`,
           `  ${pad("Dataset")}${state.dataset}${cfg.dataset !== "agent_sessions" ? " (custom via COGNEE_PLUGIN_DATASET)" : " (default, shared with Claude Code/Codex plugins)"}`,
+          `  ${pad("Federation")}${federationStatusLine()}`,
           `  ${pad("Session")}${state.sessionId || "(not started)"}`,
           `  ${pad("Datasets")}${datasets.ok && datasets.datasets.length ? datasets.datasets.slice(0, 10).map((d) => `${d.name}${d.id ? ` (${d.id.slice(0, 8)}…)` : ""}`).join(", ") : datasets.ok ? "(none readable)" : `unavailable (${describeError(datasets.error)})`}`,
           `  ${pad("Capture")}${cfg.capture ? "on" : "off (COGNEE_CAPTURE=false)"} · stored this session: ${state.capturedCount} · buffered: ${state.writeQueue.length}`,
@@ -1669,6 +1696,11 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
       state.ui = ctx.ui;
       state.cwd = ctx.cwd || process.cwd();
       state.autoIndexTried = false; // one auto-index attempt per session
+      // Config warning (exact reference error string): a malformed
+      // COGNEE_PLUGIN_READ_DATASET_IDS disabled federation — surfaced, never fatal.
+      if (cfg.readDatasetIdsError) {
+        notifySafe(`Cognee federation disabled: ${cfg.readDatasetIdsError}`, "warning");
+      }
       // Background health check — startup is never blocked by the server.
       const timer = setTimeout(() => {
         state.timers.delete(timer);

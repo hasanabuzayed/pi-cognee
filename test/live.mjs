@@ -265,6 +265,7 @@ await step("3c. session-bound recall() roundtrip", async () => {
   return pass(`ok but no 'quince' hit yet (${rec.items.length} items) — session cache itself verified in 3b; graph may need cognify (step 4)`);
 }, { timeoutMs: 20_000 });
 
+let improveSubmittedAt = 0; // set by 4a — floor for trusting a COMPLETED status in 4b
 await step("4a. graph tier: improve() submits (session→graph cognify)", async () => {
   selftestDatasetId = await findDatasetId(SELFTEST_DS, 8000); // resolved independent of improve
   let imp;
@@ -273,11 +274,20 @@ await step("4a. graph tier: improve() submits (session→graph cognify)", async 
   } catch (err) {
     return fail(describeError(err));
   }
-  if (imp.outcome === "ok") return pass(`improve submitted (dataset ${selftestDatasetId || "by name"})`);
-  if (imp.outcome === "busy") return pass("improve lock busy — server already cognifying this session");
+  if (imp.outcome === "ok") {
+    improveSubmittedAt = Date.now();
+    return pass(`improve submitted (dataset ${selftestDatasetId || "by name"})`);
+  }
+  if (imp.outcome === "busy") {
+    improveSubmittedAt = Date.now();
+    return pass("improve lock busy — server already cognifying this session");
+  }
   if (imp.outcome === "unsupported") return skip(`server lacks improve endpoint: ${imp.error?.message}`);
   if (isCapabilityGap(imp.error?.message ?? "")) return skip(`server capability: ${imp.error?.message}`);
-  if (imp.error?.transient) return skip(`improve submit timed out client-side (server may still be processing — official default bound is 420s); committed-ness verified by 4b/4c. ${imp.error.message}`);
+  if (imp.error?.transient) {
+    improveSubmittedAt = Date.now(); // the submit may still have landed server-side
+    return skip(`improve submit timed out client-side (server may still be processing — official default bound is 420s); committed-ness verified by 4b/4c. ${imp.error.message}`);
+  }
   return fail(imp.error?.message);
 }, { timeoutMs: 52_000 });
 
@@ -287,6 +297,8 @@ await step("4b. graph tier: poll datasetStatus(cognify_pipeline) short wait", as
   if (!selftestDatasetId) return skip(`dataset '${SELFTEST_DS}' not resolvable yet (created lazily by improve)`);
   const deadline = Math.min(Date.now() + 30_000, START + BUDGET_MS - 20_000);
   let last = "";
+  let sawActive = false; // a non-terminal observation proves THIS run's pipeline was seen
+  let trusted = false; // loop exited via a verified terminal break, not budget exhaustion
   while (Date.now() < deadline) {
     const st = await client.datasetStatus(selftestDatasetId, "cognify_pipeline", 8000);
     if (!st.ok) {
@@ -294,36 +306,64 @@ await step("4b. graph tier: poll datasetStatus(cognify_pipeline) short wait", as
       return fail(st.error?.message);
     }
     last = st.status ?? "(none)";
-    if (/COMPLETED|ERRORED|FAILED/.test(last)) break;
+    if (!/COMPLETED|ERRORED|FAILED/.test(last)) sawActive = true;
+    // Server quirk (probe-verified on 1.6.0): the /datasets/status entry survives
+    // dataset deletion, so a recreated deterministic-UUID dataset reports the
+    // PREVIOUS run's COMPLETED before the fresh pipeline even starts. Trust
+    // COMPLETED only after a non-terminal state was observed or the improve
+    // submit is far enough back for a stale entry to be implausible.
+    if (/ERRORED|FAILED/.test(last)) { trusted = true; break; }
+    if (/COMPLETED/.test(last) && (sawActive || (improveSubmittedAt > 0 && Date.now() - improveSubmittedAt > 8_000))) {
+      trusted = true;
+      break;
+    }
     await new Promise((r) => setTimeout(r, 3000));
   }
   cognifyTerminal = last;
   if (/ERRORED|FAILED/.test(last)) return skip(`cognify pipeline errored server-side (likely LLM/embedding config): ${last}`);
-  return pass(`cognify_pipeline status=${last}`);
+  return pass(`cognify_pipeline status=${last}${trusted ? "" : " (not reliably terminal within budget — 4c retry loop arbitrates)"}`);
 }, { timeoutMs: 35_000 });
 
 await step("4c. graph tier: recall() over " + SELFTEST_DS + " finds the fact", async () => {
-  const rec = await client.recall({
-    query: "selftest marker fruit",
-    dataset: SELFTEST_DS,
-    topK: 5,
-    onlyContext: true,
-    scope: ["graph"], // production parity: the extension + official plugins pin
-    // HYBRID_COMPLETION on completion recalls; leaving search_type unset lets the
-    // server auto-router pick, which on cognee 1.6.0 returns a scoped completion
-    // that may not echo the fact — not a path any client uses.
-    searchType: "HYBRID_COMPLETION",
-    timeoutMs: 20_000,
-  });
-  if (!rec.ok) {
-    if (isCapabilityGap(rec.error?.message ?? "")) return skip(`server capability: ${rec.error?.message}`);
-    return fail(rec.error?.message);
+  // improve is genuinely background on 1.6.0 (POST returns status:"running" in
+  // ~0.5s) while the cognify pipeline itself needs 15-30s — retry the recall in
+  // a bounded loop until the graph is actually searchable instead of trusting a
+  // single early shot.
+  const deadline = Math.min(Date.now() + 30_000, START + BUDGET_MS - 10_000);
+  let rec;
+  let blob = "";
+  while (Date.now() < deadline) {
+    rec = await client.recall({
+      query: "selftest marker fruit",
+      dataset: SELFTEST_DS,
+      topK: 5,
+      onlyContext: true,
+      scope: ["graph"], // production parity: the extension + official plugins pin
+      // HYBRID_COMPLETION on completion recalls; leaving search_type unset lets the
+      // server auto-router pick, which on cognee 1.6.0 returns a scoped completion
+      // that may not echo the fact — not a path any client uses.
+      searchType: "HYBRID_COMPLETION",
+      timeoutMs: 20_000,
+    });
+    if (!rec.ok && isCapabilityGap(rec.error?.message ?? ""))
+      return skip(`server capability: ${rec.error?.message}`);
+    if (rec.ok) {
+      blob = JSON.stringify(rec.items);
+      if (/quince/i.test(blob))
+        return pass(`graph hit (${rec.items.length} items): ${truncateText(blob, 140)}`);
+    }
+    await new Promise((r) => setTimeout(r, 3000));
   }
-  const blob = JSON.stringify(rec.items);
-  if (/quince/i.test(blob)) return pass(`graph hit (${rec.items.length} items): ${truncateText(blob, 140)}`);
+  // Retry loop exhausted — surface a persistent error as the verdict, else fall
+  // back to the cognify-terminal-based pass/skip/fail verdicts.
+  if (rec && !rec.ok) return fail(rec.error?.message);
   if (!/COMPLETED/.test(cognifyTerminal)) return skip(`graph not cognified yet (status=${cognifyTerminal || "unknown"}) — no graph to search`);
-  return fail(`cognify reported ${cognifyTerminal} but graph recall found no 'quince' (${rec.items.length} items): ${truncateText(blob, 140)}`);
-}, { timeoutMs: 25_000 });
+  return fail(`cognify reported ${cognifyTerminal} but graph recall found no 'quince' (${rec?.items.length ?? 0} items): ${truncateText(blob, 140)}`);
+  // Inner worst case: 30s deadline (+~23s overshoot of a hanging last recall +
+  // 3s sleep) ≈ 56s — cap 65s so a slow tail yields the step's own verdict, not
+  // a spurious step-timeout FAIL (the global budget still binds via
+  // Math.min(timeoutMs, leftMs())).
+}, { timeoutMs: 65_000 });
 
 await step("5. datasets: listDatasets() shows " + SELFTEST_DS, async () => {
   const listed = await client.listDatasets(10_000);
