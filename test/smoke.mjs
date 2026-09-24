@@ -12,12 +12,18 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-// Hermetic per-repo state dir (missing by design — exercises the fail-soft path)
+// Hermetic per-repo state dirs (missing by design — exercises the fail-soft path)
 // BEFORE the client module loads; the real ~/.cognee-plugin state stays untouched.
-process.env.COGNEE_CODE_STATE_DIR ??= path.join(
+const smokeStateRoot = path.join(
   import.meta.dirname ?? ".",
   `.smoke-state-${process.pid}`,
 );
+process.env.COGNEE_CODE_STATE_DIR ??= smokeStateRoot;
+// The persisted-dataset-switch record must never leak in from the real
+// ~/.cognee-plugin/pi/active-dataset.json (it would flip cfg.dataset), and the
+// cross-process breaker file must not import a real outage into the lane test.
+process.env.COGNEE_PI_STATE_DIR ??= path.join(smokeStateRoot, "pi-state");
+process.env.COGNEE_BREAKER_FILE ??= path.join(smokeStateRoot, "breaker.json");
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
@@ -147,12 +153,13 @@ await check("cognee_code tool teaches structural vs conceptual usage", () => {
   );
 });
 
-await check("registers 8+ commands", () => {
-  assert.ok(recorded.commands.length >= 8, `expected >=8 commands, got ${recorded.commands.length}`);
+await check("registers 9+ commands", () => {
+  assert.ok(recorded.commands.length >= 9, `expected >=9 commands, got ${recorded.commands.length}`);
   const names = recorded.commands.map((c) => c.name).sort();
   for (const expected of [
     "cognee",
     "cognee-code",
+    "cognee-datasets",
     "cognee-doctor",
     "cognee-forget",
     "cognee-index",
@@ -881,6 +888,569 @@ await check("pre-compact anchor handler registered on session_before_compact, de
     await new Promise((resolve) => setTimeout(resolve, 100)); // detached anchor settles fail-soft
     await recUi.events.get("session_shutdown")[0]({ type: "session_shutdown", reason: "quit" });
   } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await check("codeItemHasData: empty envelope is not a hit, prose and filled envelopes are", () => {
+  const envelope = (over) => ({ kind: "code", text: JSON.stringify({ operation: "query_facts", ...over }) });
+  assert.equal(ext.codeItemHasData(envelope({ facts: [], total: 0 })), false, "empty facts envelope → not a hit");
+  assert.equal(ext.codeItemHasData({ text: "   " }), false, "blank text → not a hit");
+  assert.equal(ext.codeItemHasData({}), false, "no content at all → not a hit");
+  assert.equal(
+    ext.codeItemHasData(envelope({ facts: ["symbol:src.x"], total: 1 })),
+    true,
+    "envelope with a non-empty array → hit",
+  );
+  assert.equal(
+    ext.codeItemHasData({ text: "symbol:src.loadCogneeConfig (src/client.ts L241)" }),
+    true,
+    "plain prose fact → hit",
+  );
+  assert.equal(ext.codeItemHasData({ text: "just prose, not JSON" }), true, "non-JSON text → hit");
+});
+
+/* ---------- auto code-recall lane: wire shape + empty-envelope fix ---------- */
+
+await check("auto code lane sends the reference wire shape (scope/code_query/dataset/session/top_k)", async () => {
+  const { mkdtempSync } = await import("node:fs");
+  const os = await import("node:os");
+  const { join } = await import("node:path");
+  const repoDir = mkdtempSync(join(os.tmpdir(), "pi-cognee-lane-"));
+  const repoDataset = clientMod.codeDatasetName(repoDir);
+  // The opt-in the lane honors: an index-state record covering the cwd.
+  clientMod.saveRepoState({
+    spec: repoDir,
+    spec_kind: "path",
+    repo_root: clientMod.canonicalRepoSpec(repoDir),
+    dataset: repoDataset,
+    index_vectors: false,
+    fingerprint: "smoke-fp",
+    last_index_at: Date.now(),
+    last_status: "completed",
+  });
+
+  const calls = [];
+  let codeResponse = "[]";
+  const realFetch = globalThis.fetch;
+  const ok = (text) => ({ ok: true, status: 200, text: async () => text });
+  globalThis.fetch = async (url, opts) => {
+    const u = String(url);
+    const body = typeof opts?.body === "string" ? JSON.parse(opts.body) : null;
+    calls.push({ url: u, body });
+    if (u.endsWith("/health")) return ok('{"status":"OK","version":"1.6.0"}');
+    if (u.endsWith("/api/v1/recall")) {
+      return ok(body?.scope?.includes("code") ? codeResponse : "[]");
+    }
+    return ok("[]");
+  };
+  try {
+    const { pi: piLane, recorded: recLane } = makeStubApi();
+    factory(piLane);
+    const ctx = {
+      hasUI: true,
+      ui: { notify() {}, setStatus() {} },
+      cwd: repoDir,
+      sessionManager: { getSessionId: () => "smoke-lane" },
+    };
+    recLane.events.get("session_start")[0]({ type: "session_start", reason: "startup" }, ctx);
+    // state.healthy=true gates before_agent_start; the ensure-dataset POST fires
+    // in the same health block AFTER the flag flips, so waiting for it is a
+    // readiness signal that cannot win the race.
+    for (
+      let i = 0;
+      i < 40 && !calls.some((c) => c.url.endsWith("/api/v1/datasets"));
+      i++
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.ok(
+      calls.some((c) => c.url.endsWith("/api/v1/datasets")),
+      "health probe ran and ensured the dataset (state.healthy=true)",
+    );
+
+    const prompt = "What calls process_payment in the billing flow?";
+    const out = await recLane.events.get("before_agent_start")[0]({ type: "before_agent_start", prompt });
+    assert.equal(out, undefined, "empty graph + empty code lane injects nothing");
+
+    const recalls = calls.filter((c) => c.url.endsWith("/api/v1/recall"));
+    const codeCalls = recalls.filter((c) => c.body?.scope?.[0] === "code");
+    assert.equal(codeCalls.length, 1, "exactly one code-scope recall per prompt");
+    const code = codeCalls[0].body;
+    // The exact reference auto-lane request (findings §1, verified against
+    // session-context-lookup.py _dispatch): code_query IS attached.
+    assert.deepEqual(code.scope, ["code"], "scope is exactly [\"code\"]");
+    assert.deepEqual(
+      code.code_query,
+      { operation: "query_facts", name: "process_payment", limit: 5 },
+      "code_query = build_code_query(identifier): query_facts + name + limit 5",
+    );
+    assert.deepEqual(code.codeQuery, code.code_query, "camelCase twin for the 1.6.0 DTO");
+    assert.equal(code.query, prompt, "query is the FULL prompt (reference seed), not the identifier");
+    assert.equal(code.top_k, 5, "reference TOP_K = 5");
+    assert.equal(code.topK, 5, "camelCase topK twin");
+    assert.equal(code.only_context, true, "only_context");
+    assert.equal(code.onlyContext, true, "camelCase onlyContext twin");
+    assert.deepEqual(code.datasets, [repoDataset], "dataset = the repo's own from index state");
+    assert.equal(code.dataset_ids, undefined, "code lane is name-addressed (no dataset_ids)");
+    assert.equal(code.session_id, "pi_smoke-lane", "session id attached on the code scope (reference parity)");
+    const graph = recalls.find((c) => c.body?.scope?.[0] === "graph").body;
+    assert.deepEqual(graph.datasets, ["agent_sessions"], "graph lane stays on the session dataset");
+
+    // Empty-envelope suppression: the server's unresolvable-seed answer is ONE
+    // entry whose text IS the envelope — it must not be counted or injected.
+    codeResponse = JSON.stringify([
+      { kind: "code", search_type: "CODE", text: '{"operation": "query_facts", "facts": [], "total": 0}' },
+    ]);
+    const outEnvelope = await recLane.events.get("before_agent_start")[0]({
+      type: "before_agent_start",
+      prompt: "what calls resolve_config here", // snake_case identifier arms the lane
+    });
+    assert.equal(outEnvelope, undefined, "empty envelope injects nothing (the observed v0.1 bug)");
+
+    // Real hit: code section renders FIRST (reference order), before the memory block.
+    codeResponse = JSON.stringify([{ kind: "code", text: "symbol:src.process_payment (src/billing.ts L41)" }]);
+    calls.length = 0;
+    const recallFn = recLane.events.get("before_agent_start")[0];
+    // graph lane gets a hit this time: stub answers non-code recalls with one memory
+    globalThis.fetch = async (url, opts) => {
+      const u = String(url);
+      const body = typeof opts?.body === "string" ? JSON.parse(opts.body) : null;
+      calls.push({ url: u, body });
+      if (u.endsWith("/health")) return ok('{"status":"OK","version":"1.6.0"}');
+      if (u.endsWith("/api/v1/recall")) {
+        return ok(body?.scope?.includes("code") ? codeResponse : '[{"source":"graph","text":"User prefers dark mode."}]');
+      }
+      return ok("[]");
+    };
+    const outHit = await recallFn({ type: "before_agent_start", prompt: "what calls process_payment again" });
+    assert.ok(outHit?.message?.content, "hit lane injects a cognee_memory message");
+    const content = outHit.message.content;
+    const codeAt = content.indexOf("=== Code graph facts ===");
+    const memAt = content.indexOf("=== Cognee memory ===");
+    assert.ok(codeAt > -1, "code section present");
+    assert.ok(memAt > -1, "memory block present");
+    assert.ok(codeAt < memAt, "code section renders FIRST (reference order)");
+    assert.ok(content.includes("symbol:src.process_payment"), "code fact text injected");
+    assert.ok(!content.includes('"facts": []'), "no raw envelope JSON injected");
+
+    // cognee_code tool: an empty envelope falls through to the no-facts warning.
+    const codeTool = recLane.tools.find((t) => t.name === "cognee_code");
+    let toolOut = await codeTool.execute("call-1", { seed: "process_payment" }, new AbortController().signal);
+    assert.ok(toolOut.content[0].text.includes("symbol:src.process_payment"), "tool reports a real fact");
+    codeResponse = JSON.stringify([
+      { kind: "code", text: '{"operation": "query_facts", "facts": [], "total": 0}' },
+    ]);
+    toolOut = await codeTool.execute("call-2", { seed: "no_such_symbol" }, new AbortController().signal);
+    assert.ok(
+      toolOut.content[0].text.includes("No code facts for 'no_such_symbol'"),
+      "empty envelope → no-facts warning",
+    );
+    assert.ok(!toolOut.content[0].text.includes('"operation"'), "no raw envelope body in the tool report");
+
+    await recLane.events.get("session_shutdown")[0]({ type: "session_shutdown", reason: "quit" });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+/* ---------- dataset switcher: persisted record, precedence, command flow ---------- */
+
+await check("switcher helpers: matchDatasets / mintSwitchSessionId / renderDatasetList / fingerprint", () => {
+  const rows = [
+    { name: "agent_sessions", id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" },
+    { name: "team_memory", id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb" },
+    { name: "dup", id: "cccccccc-cccc-cccc-cccc-cccccccccccc" },
+    { name: "dup", id: "dddddddd-dddd-dddd-dddd-dddddddddddd" },
+  ];
+  assert.equal(clientMod.matchDatasets("team_memory", rows).status, "ok", "exact name matches");
+  assert.deepEqual(
+    clientMod.matchDatasets("team_memory", rows).matches.map((m) => m.id),
+    ["bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"],
+  );
+  assert.equal(
+    clientMod.matchDatasets("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA", rows).status,
+    "ok",
+    "UUID match is canonicalized (case-insensitive)",
+  );
+  assert.equal(clientMod.matchDatasets("dup", rows).status, "ambiguous", "duplicate name → ambiguous");
+  assert.equal(clientMod.matchDatasets("nosuch", rows).status, "missing", "unlisted name → create-on-switch path");
+
+  assert.equal(clientMod.mintSwitchSessionId("pi_abc"), "pi_abc__2", "first switch mints __2");
+  assert.equal(clientMod.mintSwitchSessionId("pi_abc__2"), "pi_abc__3", "ordinal increments");
+  assert.equal(clientMod.mintSwitchSessionId("pi_abc__9"), "pi_abc__10", "double digits carry");
+
+  const listing = ext.renderDatasetList("agent_sessions", "pi_s1", rows.slice(0, 2));
+  assert.ok(listing.includes("Current dataset: agent_sessions (session pi_s1)"), "reference header format");
+  assert.ok(listing.includes(" * agent_sessions (aaaaaaaa…)"), "active row starred with id8");
+  assert.ok(listing.includes("   team_memory (bbbbbbbb…)"), "other rows unstarred");
+  assert.ok(listing.includes("no switch"), "one-off-look guidance present");
+
+  assert.equal(
+    clientMod.datasetKeyFingerprint("https://a.example", "k1"),
+    clientMod.datasetKeyFingerprint("https://a.example", "k1"),
+    "fingerprint deterministic",
+  );
+  assert.notEqual(
+    clientMod.datasetKeyFingerprint("https://a.example", "k1"),
+    clientMod.datasetKeyFingerprint("https://b.example", "k1"),
+    "fingerprint keyed by server URL",
+  );
+  assert.notEqual(
+    clientMod.datasetKeyFingerprint("https://a.example", "k1"),
+    clientMod.datasetKeyFingerprint("https://a.example", "k2"),
+    "fingerprint keyed by api key",
+  );
+});
+
+await check("active-dataset record: atomic round-trip, backend+identity scoping, corrupt tolerance", async () => {
+  const { mkdtempSync, writeFileSync, readFileSync, readdirSync } = await import("node:fs");
+  const os = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync(join(os.tmpdir(), "pi-cognee-rec-"));
+  const saved = process.env.COGNEE_PI_STATE_DIR;
+  try {
+    process.env.COGNEE_PI_STATE_DIR = dir;
+    const fp = clientMod.datasetKeyFingerprint("https://cognee.invalid", "k");
+    const record = {
+      base_url: "https://cognee.invalid",
+      key_fp: fp,
+      dataset: "team_memory",
+      session_id: "pi_host1__2",
+      previous: { dataset: "agent_sessions", session_id: "pi_host1", synced: true },
+      switched_at: "2026-09-24T12:00:00.000Z",
+    };
+    assert.equal(clientMod.saveActiveDatasetRecord(record).ok, true, "save reports ok");
+    const back = clientMod.loadActiveDatasetRecord("https://cognee.invalid", fp);
+    assert.deepEqual(back, record, "record round-trips verbatim");
+    assert.equal(
+      clientMod.loadActiveDatasetRecord("https://other.invalid", fp),
+      undefined,
+      "a record from another server is never served",
+    );
+    assert.equal(
+      clientMod.loadActiveDatasetRecord("https://cognee.invalid", "deadbeef"),
+      undefined,
+      "a record from another identity is never served",
+    );
+    assert.equal(
+      readdirSync(dir).filter((n) => n.endsWith(".tmp")).length,
+      0,
+      "atomic write leaves no temp files",
+    );
+    writeFileSync(join(dir, "active-dataset.json"), "{corrupt", "utf8");
+    assert.equal(
+      clientMod.loadActiveDatasetRecord("https://cognee.invalid", fp),
+      undefined,
+      "corrupt record tolerated (env seed stays in charge)",
+    );
+  } finally {
+    if (saved === undefined) delete process.env.COGNEE_PI_STATE_DIR;
+    else process.env.COGNEE_PI_STATE_DIR = saved;
+  }
+});
+
+await check("loadCogneeConfig: persisted switch beats the COGNEE_PLUGIN_DATASET seed (env only seeds)", async () => {
+  const { mkdtempSync } = await import("node:fs");
+  const os = await import("node:os");
+  const { join } = await import("node:path");
+  const stateDir = mkdtempSync(join(os.tmpdir(), "pi-cognee-prec-"));
+  const envFile = join(mkdtempSync(join(os.tmpdir(), "pi-cognee-prenv-")), ".env");
+  const keys = ["COGNEE_PI_STATE_DIR", "COGNEE_API_KEY", "COGNEE_ENV_FILE", "COGNEE_PLUGIN_DATASET"];
+  const saved = keys.map((k) => process.env[k]);
+  try {
+    process.env.COGNEE_PI_STATE_DIR = stateDir;
+    process.env.COGNEE_API_KEY = "smoke-key"; // deterministic key fingerprint
+    process.env.COGNEE_ENV_FILE = envFile; // absent file — no env-file values
+    delete process.env.COGNEE_PLUGIN_DATASET;
+
+    // No record: default seed.
+    let cfg = clientMod.loadCogneeConfig();
+    assert.equal(cfg.dataset, "agent_sessions", "no record → default dataset");
+    assert.equal(cfg.datasetSource, "default", "source: default");
+    assert.equal(cfg.switchSessionId, undefined, "no adopted session id");
+
+    // No record + env seed: the seed wins.
+    process.env.COGNEE_PLUGIN_DATASET = "env_seed";
+    cfg = clientMod.loadCogneeConfig();
+    assert.equal(cfg.dataset, "env_seed", "env seed applies without a record");
+    assert.equal(cfg.datasetSource, "COGNEE_PLUGIN_DATASET", "source: env seed");
+
+    // Persist a switch for THIS backend+identity: the record wins over the seed.
+    const fp = clientMod.datasetKeyFingerprint(cfg.baseUrl, "smoke-key");
+    assert.equal(
+      clientMod.saveActiveDatasetRecord({
+        base_url: cfg.baseUrl,
+        key_fp: fp,
+        dataset: "team_memory",
+        session_id: "pi_host1__2",
+        previous: { dataset: "agent_sessions", session_id: "pi_host1", synced: true },
+        switched_at: "2026-09-24T12:00:00.000Z",
+      }).ok,
+      true,
+      "record saved",
+    );
+    cfg = clientMod.loadCogneeConfig();
+    assert.equal(cfg.dataset, "team_memory", "persisted switch wins over the env seed");
+    assert.equal(cfg.datasetSource, "persisted switch", "source: persisted switch");
+    assert.equal(cfg.switchSessionId, "pi_host1__2", "session id adopted from the record");
+    assert.equal(cfg.datasetSwitchedFrom, "agent_sessions", "retired dataset surfaced as provenance");
+    assert.equal(cfg.datasetSwitchedAt, "2026-09-24T12:00:00.000Z", "switch timestamp surfaced");
+  } finally {
+    keys.forEach((k, i) => {
+      if (saved[i] === undefined) delete process.env[k];
+      else process.env[k] = saved[i];
+    });
+  }
+});
+
+await check("switcher command flow: list → validate → strict-sync abort/--force → persist → affinity", async () => {
+  const { mkdtempSync, readFileSync, readdirSync, existsSync } = await import("node:fs");
+  const os = await import("node:os");
+  const { join } = await import("node:path");
+  const stateDir = mkdtempSync(join(os.tmpdir(), "pi-cognee-sw-"));
+  const workDir = mkdtempSync(join(os.tmpdir(), "pi-cognee-swcwd-")); // not a git repo → no auto-index noise
+  const envFile = join(mkdtempSync(join(os.tmpdir(), "pi-cognee-swenv-")), ".env");
+  const keys = ["COGNEE_PI_STATE_DIR", "COGNEE_API_KEY", "COGNEE_ENV_FILE", "COGNEE_PLUGIN_DATASET"];
+  const saved = keys.map((k) => process.env[k]);
+  const realFetch = globalThis.fetch;
+  const recordPath = () => join(process.env.COGNEE_PI_STATE_DIR, "active-dataset.json");
+  try {
+    process.env.COGNEE_PI_STATE_DIR = stateDir;
+    process.env.COGNEE_API_KEY = "smoke-key";
+    process.env.COGNEE_ENV_FILE = envFile;
+    delete process.env.COGNEE_PLUGIN_DATASET;
+
+    const rows = [
+      { name: "agent_sessions", id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", owner_id: "u1" },
+      { name: "team_memory", id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", owner_id: "u1" },
+      { name: "dup", id: "cccccccc-cccc-cccc-cccc-cccccccccccc", owner_id: "u1" },
+      { name: "dup", id: "dddddddd-dddd-dddd-dddd-dddddddddddd", owner_id: "u1" },
+    ];
+    let createOk = true;
+    let improveFails = false;
+    const ok = (text) => ({ ok: true, status: 200, text: async () => text });
+    const apiCalls = [];
+    const rememberBodies = [];
+    const improveBodies = [];
+    const firstFetch = async (url, opts) => {
+      const u = String(url);
+      const method = opts?.method ?? "GET";
+      apiCalls.push(u);
+      if (u.endsWith("/health")) return ok('{"status":"OK","version":"1.6.0"}');
+      if (u.endsWith("/api/v1/datasets")) {
+        if (method === "POST") {
+          return createOk
+            ? ok("{}")
+            : { ok: false, status: 400, text: async () => '{"error":"invalid dataset name"}' };
+        }
+        return ok(JSON.stringify(rows));
+      }
+      if (u.endsWith("/api/v1/remember/entry")) {
+        if (typeof opts?.body === "string") rememberBodies.push(JSON.parse(opts.body));
+        return ok("{}");
+      }
+      if (u.endsWith("/api/v1/improve")) {
+        if (typeof opts?.body === "string") improveBodies.push(JSON.parse(opts.body));
+        return ok(improveFails ? '{"status":"errored","error":"boom"}' : '{"status":"completed"}');
+      }
+      return ok("[]");
+    };
+    globalThis.fetch = firstFetch;
+
+    const { pi: piSw, recorded: recSw } = makeStubApi();
+    factory(piSw);
+    const messages = [];
+    const statuses = [];
+    const ctx = {
+      hasUI: true,
+      ui: {
+        notify: (m, t) => messages.push({ m, t }),
+        setStatus: (_k, v) => statuses.push(v),
+      },
+      cwd: workDir,
+      sessionManager: { getSessionId: () => "smoke-switch" },
+    };
+    recSw.events.get("session_start")[0]({ type: "session_start", reason: "startup" }, ctx);
+    for (let i = 0; i < 40 && !apiCalls.some((u) => u.endsWith("/api/v1/datasets")); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const cmd = recSw.commands.find((c) => c.name === "cognee-datasets");
+    assert.ok(cmd, "cognee-datasets command registered");
+    const lastMsg = () => messages[messages.length - 1]?.m ?? "";
+
+    // List (reference format).
+    await cmd.handler("", ctx);
+    assert.ok(lastMsg().includes("Current dataset: agent_sessions (session pi_smoke-switch)"), `list header: ${lastMsg()}`);
+    assert.ok(lastMsg().includes(" * agent_sessions (aaaaaaaa…)"), "active row starred");
+    assert.ok(lastMsg().includes("   team_memory (bbbbbbbb…)"), "other rows listed");
+
+    // Usage guard + already-active no-op.
+    await cmd.handler("a b", ctx);
+    assert.ok(lastMsg().startsWith("Usage:"), "two positionals → usage");
+    await cmd.handler("agent_sessions", ctx);
+    assert.ok(lastMsg().includes("Already active: 'agent_sessions'"), "same-dataset switch is a no-op");
+
+    // Ambiguous + unlistable names refuse up front (never half-switch).
+    await cmd.handler("dup", ctx);
+    assert.ok(lastMsg().includes("Ambiguous") && lastMsg().includes("select its UUID"), "ambiguous name refused");
+    createOk = false;
+    await cmd.handler("nosuch", ctx);
+    assert.ok(lastMsg().includes("Cannot switch to 'nosuch'"), "uncreatable name refused");
+    assert.ok(!existsSync(recordPath()), "no record written by a refused switch");
+    createOk = true;
+
+    // Capture one turn so the strict pre-switch sync has something to improve.
+    const messageEnd = recSw.events.get("message_end")[0];
+    messageEnd({ message: { role: "user", content: "what do we know about the switcher" } }, ctx);
+    messageEnd({ message: { role: "assistant", content: "It syncs then re-points." } }, ctx);
+    recSw.events.get("agent_settled")[0]();
+    for (let i = 0; i < 20 && !apiCalls.some((u) => u.endsWith("/api/v1/remember/entry")); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.ok(apiCalls.some((u) => u.endsWith("/api/v1/remember/entry")), "captured turn drained");
+    // F5: entries are bound to the session/dataset active at CAPTURE time; the
+    // wire payload itself keeps the reference shape (binding stripped on send).
+    const bound = rememberBodies.at(-1);
+    assert.ok(bound, "remember/entry body observed");
+    assert.equal(bound.session_id, "pi_smoke-switch", "F5: entry drains into its capture-time session");
+    assert.equal(bound.dataset_name, "agent_sessions", "F5: entry drains into its capture-time dataset");
+    assert.deepEqual(
+      Object.keys(bound.entry ?? {}).sort(),
+      ["answer", "context", "question", "type"],
+      "F5: wire entry payload unchanged (no binding keys leaked)",
+    );
+
+    // Strict-sync failure aborts the switch (unless --force).
+    improveFails = true;
+    await cmd.handler("team_memory", ctx);
+    assert.ok(lastMsg().includes("Switch aborted"), "failed pre-switch sync aborts");
+    assert.ok(!existsSync(recordPath()), "aborted switch wrote no record");
+
+    // --force switches anyway; the retired session keeps its session-end sync.
+    await cmd.handler("team_memory --force", ctx);
+    assert.ok(
+      lastMsg().includes("Switched to dataset 'team_memory' (session pi_smoke-switch__2)"),
+      `force switch success line: ${lastMsg()}`,
+    );
+    assert.ok(lastMsg().includes("NOT synced (--force)"), "force reports the unsynced previous session");
+    assert.ok(lastMsg().includes("no longer injected"), "success line states the recall scoping");
+    let record = JSON.parse(readFileSync(recordPath(), "utf8"));
+    assert.equal(record.dataset, "team_memory", "record carries the new dataset");
+    assert.equal(record.session_id, "pi_smoke-switch__2", "record carries the minted session id");
+    assert.deepEqual(
+      record.previous,
+      { dataset: "agent_sessions", session_id: "pi_smoke-switch", synced: false },
+      "retired triple recorded (unsynced)",
+    );
+    assert.equal(record.base_url, clientMod.loadCogneeConfig().baseUrl, "record scoped to this server");
+    assert.ok(statuses.some((s) => s.endsWith("team_memory")), `statusline refreshed: ${statuses.at(-1)}`);
+
+    // /cognee + /cognee-doctor surface the switch provenance + source.
+    await recSw.commands.find((c) => c.name === "cognee").handler("", ctx);
+    assert.ok(lastMsg().includes("switched from agent_sessions"), "/cognee Dataset line carries provenance");
+    await recSw.commands.find((c) => c.name === "cognee-doctor").handler("", ctx);
+    assert.ok(lastMsg().includes("persisted switch"), "/cognee-doctor names the persisted-switch source");
+    assert.ok(lastMsg().includes("active-dataset.json"), "/cognee-doctor shows the state-file path");
+
+    // Switch back: ordinal mints __3, previous synced this time.
+    improveFails = false;
+    await cmd.handler("agent_sessions", ctx);
+    assert.ok(
+      lastMsg().includes("Switched to dataset 'agent_sessions' (session pi_smoke-switch__3)"),
+      `ordinal mint: ${lastMsg()}`,
+    );
+    assert.ok(lastMsg().includes("synced into 'team_memory'"), "strict sync ran before the switch");
+    record = JSON.parse(readFileSync(recordPath(), "utf8"));
+    assert.deepEqual(
+      record.previous,
+      { dataset: "team_memory", session_id: "pi_smoke-switch__2", synced: true },
+      "retired triple recorded (synced)",
+    );
+
+    // Persist failure rolls back: "switch was not persisted; nothing was changed".
+    process.env.COGNEE_PI_STATE_DIR = join("/dev", "null", "nope"); // mkdir fails
+    await cmd.handler("team_memory", ctx);
+    assert.ok(lastMsg().includes("Switch was not persisted"), "persist failure surfaced");
+    assert.ok(lastMsg().includes("nothing was changed"), "rollback message (reference exit-4 shape)");
+    process.env.COGNEE_PI_STATE_DIR = stateDir;
+    await cmd.handler("", ctx);
+    assert.ok(lastMsg().includes("Current dataset: agent_sessions"), "rollback restored the active dataset");
+
+    // Session affinity: a NEW factory (next config load) adopts the record's
+    // dataset AND session id — capture/recall/sync re-point automatically.
+    await cmd.handler("team_memory", ctx); // record → team_memory / pi_smoke-switch__4
+    const cfgAff = clientMod.loadCogneeConfig();
+    assert.equal(cfgAff.dataset, "team_memory", "next config load picks up the switch");
+    assert.equal(cfgAff.datasetSource, "persisted switch", "config source labels the switch");
+    assert.equal(cfgAff.switchSessionId, "pi_smoke-switch__4", "record session id exposed");
+
+    const recallBodies = [];
+    globalThis.fetch = async (url, opts) => {
+      const u = String(url);
+      if (u.endsWith("/api/v1/recall") && typeof opts?.body === "string") {
+        recallBodies.push(JSON.parse(opts.body));
+      }
+      if (u.endsWith("/health")) return ok('{"status":"OK","version":"1.6.0"}');
+      if (u.endsWith("/api/v1/datasets")) return ok("[]");
+      return ok("[]");
+    };
+    const { pi: piAff, recorded: recAff } = makeStubApi();
+    factory(piAff); // loadCogneeConfig() → the persisted record wins
+    const affCtx = {
+      hasUI: true,
+      ui: { notify() {}, setStatus() {} },
+      cwd: workDir,
+      sessionManager: { getSessionId: () => "smoke-affinity" },
+    };
+    recAff.events.get("session_start")[0]({ type: "session_start", reason: "startup" }, affCtx);
+    await new Promise((resolve) => setTimeout(resolve, 100)); // health probe settles
+    const out = await recAff.events.get("before_agent_start")[0]({
+      type: "before_agent_start",
+      prompt: "how does auth work here", // no identifier → graph lane only
+    });
+    assert.equal(out, undefined, "no hits → nothing injected");
+    const graph = recallBodies.find((b) => b.scope?.[0] === "graph");
+    assert.ok(graph, "graph recall fired");
+    assert.deepEqual(graph.datasets, ["team_memory"], "recall lane picked up the active dataset");
+    assert.equal(graph.session_id, "pi_smoke-switch__4", "session affinity: adopted session id from the record");
+    await recAff.events.get("session_shutdown")[0]({ type: "session_shutdown", reason: "quit" });
+    globalThis.fetch = firstFetch; // restore the recording mock for the checks below
+
+    // F4: an overlapping switch invocation is refused while one is in flight
+    // (in-process lock — the second call must not mint or persist anything).
+    const overlappingFirst = cmd.handler("agent_sessions", ctx);
+    const overlappingSecond = cmd.handler("team_memory", ctx);
+    await Promise.all([overlappingFirst, overlappingSecond]);
+    assert.ok(
+      messages.some(({ m }) => m.includes("already in progress")),
+      "F4: re-entrant switch refused",
+    );
+
+    assert.equal(
+      readdirSync(stateDir).filter((n) => n.endsWith(".tmp")).length,
+      0,
+      "no temp files left behind",
+    );
+    await recSw.events.get("session_shutdown")[0]({ type: "session_shutdown", reason: "quit" });
+    // F3: the session retired by a --force switch past a failed sync gets its
+    // own promotion pass at the session-end sync — the LAST improve call is
+    // that retired pair (current session is promoted first, retired second).
+    const lastImprove = improveBodies.at(-1);
+    assert.ok(lastImprove, "final sync fired improve");
+    assert.deepEqual(
+      lastImprove.session_ids,
+      ["pi_smoke-switch"],
+      "F3: final sync promotes the retired unsynced session",
+    );
+    assert.equal(lastImprove.dataset_name, "agent_sessions", "F3: retired session improved into its own dataset");
+  } finally {
+    keys.forEach((k, i) => {
+      if (saved[i] === undefined) delete process.env[k];
+      else process.env[k] = saved[i];
+    });
     globalThis.fetch = realFetch;
   }
 });

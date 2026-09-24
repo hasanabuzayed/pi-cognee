@@ -182,8 +182,18 @@ export interface CogneeConfig {
   envFileExists: boolean;
   envFileKeys: string[];
   shellOverrides: string[];
-  /** Default dataset (graph tier). `agent_sessions` is shared with the official plugins. */
+  /** Default dataset (graph tier). `agent_sessions` is shared with the official plugins.
+   *  Once a switch was persisted for this backend, the record's dataset wins over
+   *  the COGNEE_PLUGIN_DATASET seed (the reference's "env only seeds" precedence). */
   dataset: string;
+  /** Where `dataset` came from — surfaced by /cognee-doctor and switch provenance. */
+  datasetSource: "default" | "COGNEE_PLUGIN_DATASET" | "persisted switch";
+  /** Retired dataset + when, when a persisted switch is active (provenance). */
+  datasetSwitchedFrom?: string;
+  datasetSwitchedAt?: string;
+  /** Session id recorded by the persisted switch — adopted at session start so a
+   *  resumed conversation keeps bridging into the switched session. */
+  switchSessionId?: string;
   /** Federated graph-recall read set (COGNEE_PLUGIN_READ_DATASET_IDS — JSON array of
    *  UUIDs, read-only federation; writes never consult it). */
   readDatasetIds?: string[];
@@ -348,6 +358,16 @@ export function loadCogneeConfig(): CogneeConfig {
   const readDatasetIdsSource: "shell env" | "env file" =
     process.env.COGNEE_PLUGIN_READ_DATASET_IDS !== undefined ? "shell env" : "env file";
 
+  // Persisted dataset switch (reference launch-record semantics): the record's
+  // dataset wins over the COGNEE_PLUGIN_DATASET seed — "env only seeds the first
+  // launch". Keyed by server URL + key fingerprint so a switch minted for one
+  // backend/identity is never served to another. Absent/corrupt → seed wins.
+  const activeRecord = loadActiveDatasetRecord(baseUrl, datasetKeyFingerprint(baseUrl, apiKey));
+  const datasetSeed = effective("COGNEE_PLUGIN_DATASET");
+  const dataset = activeRecord
+    ? sanitizeDatasetName(activeRecord.dataset)
+    : sanitizeDatasetName(datasetSeed || "agent_sessions");
+
   return {
     backend,
     backendForced,
@@ -361,7 +381,15 @@ export function loadCogneeConfig(): CogneeConfig {
     envFileExists: envFile.exists,
     envFileKeys,
     shellOverrides,
-    dataset: sanitizeDatasetName(effective("COGNEE_PLUGIN_DATASET") || "agent_sessions"),
+    dataset,
+    datasetSource: activeRecord
+      ? "persisted switch"
+      : datasetSeed
+        ? "COGNEE_PLUGIN_DATASET"
+        : "default",
+    datasetSwitchedFrom: activeRecord?.previous?.dataset,
+    datasetSwitchedAt: activeRecord?.switched_at,
+    switchSessionId: activeRecord?.session_id,
     readDatasetIds: readDatasetParsed.datasetIds,
     readDatasetIdsSource: readDatasetParsed.datasetIds ? readDatasetIdsSource : undefined,
     readDatasetIdsError: readDatasetParsed.error,
@@ -434,6 +462,34 @@ export function sanitizeDatasetName(name: string): string {
 
 export function sanitizeSessionId(id: string): string {
   return id.replace(/[^A-Za-z0-9-_.]/g, "-").slice(0, 120);
+}
+
+/**
+ * `mint_switch_session_id` from the reference, ported: a switch never reuses
+ * a session id — it mints the next ordinal suffix (`pi_x`, `pi_x__2`, `__3`, …),
+ * so the new session never collides while staying readable in the dashboard.
+ */
+export function mintSwitchSessionId(current: string): string {
+  const m = current.match(/^(.*)__(\d+)$/);
+  return m ? `${m[1]}__${Number(m[2]) + 1}` : `${current}__2`;
+}
+
+/**
+ * Match a user-given switch target against readable dataset rows: exact name,
+ * or UUID (canonicalized — "Dataset UUIDs are authoritative"). More than one
+ * row → ambiguous ("select its UUID"); zero → not listed (create-on-switch is
+ * the picker's free-typed "Other" behavior, decided by the caller).
+ */
+export function matchDatasets(
+  target: string,
+  rows: { name: string; id: string }[],
+): { status: "ok" | "ambiguous" | "missing"; matches: { name: string; id: string }[] } {
+  const uuid = canonicalUuid(target);
+  const matches = rows.filter((d) => (uuid ? canonicalUuid(d.id) === uuid : d.name === target));
+  return {
+    status: matches.length === 0 ? "missing" : matches.length > 1 ? "ambiguous" : "ok",
+    matches,
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -879,6 +935,83 @@ export function saveSharedBreaker(
 }
 
 /* ------------------------------------------------------------------ */
+/* Persisted dataset switch (~/.cognee-plugin/pi/active-dataset.json)  */
+/* The pi analog of the reference launch record: a switch must survive  */
+/* restarts and resumes. pi has no stable host session id across        */
+/* processes, so this record IS the session affinity.                   */
+/* ------------------------------------------------------------------ */
+
+export interface ActiveDatasetRecord {
+  /** Server the switch was recorded for — never served to another backend. */
+  base_url: string;
+  /** sha256(baseUrl + effective api key) — same discipline as the reference's
+   *  readable-datasets cache: an active dataset minted for one identity is
+   *  never served to another. */
+  key_fp: string;
+  dataset: string;
+  /** Ordinal-suffixed session id minted by the switch (adopted on restart). */
+  session_id: string;
+  /** The retired triple (the reference keeps these in `touched`). */
+  previous?: { dataset: string; session_id: string; synced: boolean };
+  switched_at: string;
+}
+
+export const DEFAULT_PI_STATE_DIR = join(homedir(), ".cognee-plugin", "pi");
+
+/** pi-side state dir (~/.cognee-plugin/pi), override for tests/embedding. */
+export function piStateDir(): string {
+  return process.env.COGNEE_PI_STATE_DIR ?? DEFAULT_PI_STATE_DIR;
+}
+
+export function activeDatasetPath(): string {
+  return join(piStateDir(), "active-dataset.json");
+}
+
+/** The server+identity fingerprint a persisted switch is keyed by. */
+export function datasetKeyFingerprint(baseUrl: string, apiKey?: string): string {
+  return createHash("sha256").update(`${baseUrl}\n${apiKey ?? ""}`, "utf8").digest("hex");
+}
+
+/** Read the persisted active-dataset record; undefined unless it exists, parses,
+ *  and belongs to exactly this backend (base_url + key fingerprint). Fail-soft:
+ *  an absent or corrupt record leaves the env seed in charge, never a crash. */
+export function loadActiveDatasetRecord(
+  baseUrl: string,
+  keyFp: string,
+): ActiveDatasetRecord | undefined {
+  try {
+    const raw = JSON.parse(readFileSync(activeDatasetPath(), "utf8")) as ActiveDatasetRecord;
+    if (!raw || typeof raw !== "object") return undefined;
+    if (raw.base_url !== baseUrl || raw.key_fp !== keyFp) return undefined;
+    if (typeof raw.dataset !== "string" || !raw.dataset) return undefined;
+    if (typeof raw.session_id !== "string" || !raw.session_id) return undefined;
+    return raw;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Atomically persist the active-dataset record (tmp + rename, same pattern as
+ *  the other state writers). Unlike them this one REPORTS failure: the switcher
+ *  must roll back when the record cannot be persisted ("nothing was changed").
+ *  Never throws. */
+export function saveActiveDatasetRecord(
+  record: ActiveDatasetRecord,
+): { ok: boolean; error?: string } {
+  try {
+    const dir = piStateDir();
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, "active-dataset.json");
+    const tmp = `${path}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(record, null, 2) + "\n", "utf8");
+    renameSync(tmp, path);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: describeError(err) };
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* Capture policy: redaction + truncation (per the claude-code brief §4) */
 /* ------------------------------------------------------------------ */
 
@@ -1026,6 +1159,12 @@ export class CogneeClient {
   private authHeaders(): Record<string, string> {
     const key = this.cfg.apiKey ?? this.mintedKey;
     return key ? { "X-Api-Key": key } : {};
+  }
+
+  /** The server+identity fingerprint under which a persisted dataset switch is
+   *  stored for this client (baseUrl + the EFFECTIVE key, mint included). */
+  keyFingerprint(): string {
+    return datasetKeyFingerprint(this.cfg.baseUrl, this.cfg.apiKey ?? this.mintedKey);
   }
 
   /** Effective key source for display, including the lazy local bootstrap mint. */
@@ -1536,8 +1675,9 @@ export class CogneeClient {
    * (the exact endpoint cognee-search.sh --code uses). Without `codeQuery` the
    * seed text is the query (exact/suffix/substring match); with it, one exact
    * operation runs (query_facts, explore, traverse, find_path, impact_analysis,
-   * delta). No session_id: the code dataset is a foreign dataset for this
-   * session, and the server binds session ids to the session dataset only.
+   * delta). session_id is optional and, when given, attached exactly like the
+   * reference auto lane does ("session_id attached on the code scope too" — the
+   * server keeps the binding to the session dataset, not the code one).
    * No CLI fallback exists for this route — unreachable means "not run".
    */
   async codeSearch(params: {
@@ -1545,11 +1685,15 @@ export class CogneeClient {
     codeQuery?: Record<string, unknown>;
     dataset: string;
     topK?: number;
+    /** Attached on the code scope too (the reference's auto lane sends it); the
+     *  server binds session ids to the session dataset, never to the code one. */
+    sessionId?: string;
     timeoutMs?: number;
     externalSignal?: AbortSignal;
   }): Promise<RecallResult> {
     return this.recall({
       query: params.seed,
+      sessionId: params.sessionId,
       topK: params.topK ?? 5,
       onlyContext: true,
       scope: ["code"],

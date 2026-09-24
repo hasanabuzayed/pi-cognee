@@ -32,22 +32,35 @@ import {
   isLoopbackUrl,
   isRemoteRepoSpec,
   isUuid,
+  loadActiveDatasetRecord,
   loadCogneeConfig,
   loadSharedBreaker,
+  matchDatasets,
+  mintSwitchSessionId,
+  activeDatasetPath,
   readRememberFile,
   redactSecrets,
   sanitizeDatasetName,
   sanitizeSessionId,
+  saveActiveDatasetRecord,
   saveRepoState,
   saveSharedBreaker,
   truncateText,
   wrapAsCogneeError,
+  type ActiveDatasetRecord,
   type CogneeConfig,
   type CodeRepoState,
   type HealthResult,
   type QaEntry,
   type RecallItem,
 } from "./client";
+
+/** A captured QA entry BOUND to the session+dataset it was captured under.
+ *  Binding happens at capture time so a later dataset switch can never
+ *  mis-attribute buffered writes into the new dataset (the reference binds
+ *  pending entries to the retired triple the same way). The binding is
+ *  plugin-internal — it is stripped before the wire payload is built. */
+type BoundQaEntry = QaEntry & { sessionId: string; dataset: string };
 
 /* ------------------------------------------------------------------ */
 /* Limits (aligned with the official plugins' capture policy)          */
@@ -200,6 +213,58 @@ function renderCodeFacts(items: RecallItem[], maxChars: number): string {
   return ["=== Code graph facts ===", ...lines, "=== End code graph facts ==="].join("\n");
 }
 
+/**
+ * True when a code item carries data: non-envelope text, or an envelope with a
+ * non-empty result array (mirrors test/live.mjs codeHasData). The server does
+ * NOT return "no results" for an unresolvable code seed — it returns ONE entry
+ * whose text IS the raw envelope ("{\"operation\": \"query_facts\", \"facts\": [], …}").
+ * The reference dodges this only via its server-contract assumption; on this
+ * server version the empty envelope must be filtered out before counting hits,
+ * or the lane injects `{"facts":[],"total":0}` as if it were a fact.
+ */
+export function codeItemHasData(item: RecallItem): boolean {
+  const text = String(item.text ?? item.content ?? "").trim();
+  if (!text) return false;
+  try {
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && "operation" in parsed) {
+      return Object.values(parsed).some((v) => Array.isArray(v) && v.length > 0);
+    }
+    return true;
+  } catch {
+    return true; // non-JSON prose hit
+  }
+}
+
+/**
+ * List rendering for /cognee-datasets — mirrors the reference picker format:
+ * `Current dataset: X (session Y)` header, one row per readable dataset with the
+ * active one starred (` * name (id8…)`), plus the reference's guidance that a
+ * one-off LOOK in another dataset needs no switch (per-call dataset overrides).
+ */
+export function renderDatasetList(
+  currentDataset: string,
+  sessionId: string,
+  datasets: { name: string; id: string }[],
+): string {
+  const rows = datasets.length
+    ? datasets.map((d) => {
+        const id8 = d.id ? ` (${d.id.slice(0, 8)}…)` : "";
+        return `${d.name === currentDataset ? " * " : "   "}${d.name}${id8}`;
+      })
+    : ["   (no readable datasets)"];
+  return [
+    `Current dataset: ${currentDataset} (session ${sessionId || "(not started)"})`,
+    ...rows,
+    "",
+    "Switch: /cognee-datasets <name> — syncs the current session, mints a new session id,",
+    "and re-points capture/recall/sync (unlisted names are created on switch; --force",
+    "skips a failed pre-switch sync). Recall is scoped to the active dataset — context",
+    "from the previous one is no longer injected until you switch back.",
+    "One-off look in another dataset (no switch): /cognee-search <query> --dataset <name>.",
+  ].join("\n");
+}
+
 /* ------------------------------------------------------------------ */
 /* Extension factory                                                   */
 /* ------------------------------------------------------------------ */
@@ -229,10 +294,18 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
     datasetEnsured: false,
     sessionId: "",
     dataset: cfg.dataset,
+    /* switch provenance — set from the persisted record, updated on a live switch */
+    datasetSource: cfg.datasetSource,
+    datasetSwitchedFrom: cfg.datasetSwitchedFrom ?? null,
+    datasetSwitchedAt: cfg.datasetSwitchedAt ?? null,
     pendingQuestion: null as string | null,
     pendingAnswer: null as string | null,
-    writeQueue: [] as QaEntry[],
+    writeQueue: [] as BoundQaEntry[],
     draining: false,
+    /* re-entry guard for the dataset-switch command (in-process analog of the reference .switch.lock) */
+    switching: false,
+    /* sessions retired by a --force switch past a failed sync: finalSync promotes them too */
+    retiredSessions: [] as { sessionId: string; dataset: string }[],
     capturedCount: 0,
     droppedCount: 0,
     lastImprovedCount: 0,
@@ -285,6 +358,26 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
       return `autoindex ${cfg.codeAutoindex}${repo?.dataset ? ` · ${repo.dataset} (${repo.spec_kind})${when}` : " · no indexed repo for cwd"}`;
     } catch {
       return "unavailable";
+    }
+  }
+
+  /** Switch provenance for the /cognee Dataset line: `agent_sessions (switched from X at HH:MM)`. */
+  function datasetSwitchSuffix(): string {
+    if (!state.datasetSwitchedFrom || state.datasetSwitchedFrom === state.dataset) return "";
+    const when = state.datasetSwitchedAt ? new Date(state.datasetSwitchedAt) : undefined;
+    const whenText = when && !Number.isNaN(when.getTime()) ? ` at ${when.toLocaleTimeString()}` : "";
+    return ` (switched from ${state.datasetSwitchedFrom}${whenText})`;
+  }
+
+  /** Dataset source label for /cognee-doctor: default | COGNEE_PLUGIN_DATASET | persisted switch. */
+  function datasetSourceLabel(): string {
+    switch (state.datasetSource) {
+      case "persisted switch":
+        return `persisted switch (wins over the COGNEE_PLUGIN_DATASET seed until you switch back; record: ${activeDatasetPath()})`;
+      case "COGNEE_PLUGIN_DATASET":
+        return "custom via COGNEE_PLUGIN_DATASET";
+      default:
+        return "default, shared with the Claude Code/Codex plugins";
     }
   }
 
@@ -622,7 +715,9 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
    * Arm the per-prompt code recall lane: fires only when the prompt carries an
    * identifier-shaped token AND the cwd sits inside a repo this extension
    * indexed — never on conversational prompts, never on unindexed repos
-   * (same gate as the official plugins' auto_code_lane).
+   * (same gate as the official plugins' auto_code_lane). The payload is the
+   * reference's build_code_query() — query_facts + the first identifier +
+   * limit 5 — resolved against the repo's own index-state dataset.
    */
   function armCodeLane(prompt: string): { dataset: string; identifier: string; codeQuery: Record<string, unknown> } | undefined {
     try {
@@ -672,7 +767,7 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
       // ponytail: drop-oldest silently — bounded memory beats unbounded growth;
       // the official plugins spill to a disk bridge instead (deferred).
     }
-    state.writeQueue.push(entry);
+    state.writeQueue.push({ ...entry, sessionId: state.sessionId, dataset: state.dataset });
     void drainWriteQueue().catch(() => {});
   }
 
@@ -683,12 +778,15 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
       while (state.writeQueue.length > 0 && state.healthy && (opts.force || !state.stopped)) {
         if (opts.deadline !== undefined && Date.now() >= opts.deadline) break;
         const next = state.writeQueue[0];
+        // Bound at capture: each entry drains into the session/dataset it was
+        // captured under — never whichever one happens to be active at drain time.
+        const { sessionId, dataset, ...entry } = next;
         // Bounded per-request timeout when a deadline is in force (final sync).
         const timeoutMs =
           opts.deadline !== undefined
             ? Math.max(1000, Math.min(cfg.requestTimeoutMs, opts.deadline - Date.now()))
             : undefined;
-        const result = await client.rememberEntry(next, state.sessionId, state.dataset, timeoutMs);
+        const result = await client.rememberEntry(entry, sessionId, dataset, timeoutMs);
         if (result.ok) {
           state.writeQueue.shift();
           state.capturedCount++;
@@ -742,8 +840,20 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
       if (state.healthy) {
         await drainWriteQueue({ force: true, deadline: Date.now() + FINAL_SYNC_TIMEOUT_MS });
       }
-      if (state.capturedCount === 0) return;
-      await client.improve(state.sessionId, state.dataset, FINAL_SYNC_TIMEOUT_MS);
+      if (state.capturedCount > 0) {
+        await client.improve(state.sessionId, state.dataset, FINAL_SYNC_TIMEOUT_MS);
+      }
+      // Sessions retired by a --force switch past a failed sync get their own
+      // promotion pass: their buffered writes were bound at capture time and
+      // drained above, so only the graph promote remains (our analog of the
+      // reference's `touched` retry).
+      for (const retired of state.retiredSessions) {
+        try {
+          await client.improve(retired.sessionId, retired.dataset, FINAL_SYNC_TIMEOUT_MS);
+        } catch {
+          /* fail-soft per retired session */
+        }
+      }
     } catch {
       /* fail-soft */
     }
@@ -1118,13 +1228,17 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           externalSignal: signal,
         });
         if (!result.ok) return errResult("cognee_code failed", result.error);
-        const body = renderCodeItems(result.items);
+        // Empty envelopes (facts: [], total: 0) are "no such symbol", not hits —
+        // filtered so they fall through to the no-facts warning instead of
+        // reporting raw {"facts":[],"total":0} JSON as the body.
+        const hits = result.items.filter(codeItemHasData);
+        const body = renderCodeItems(hits);
         return textResult(
           body ||
             (result.noGraph
               ? `Code dataset '${resolved.dataset}' has no graph yet — indexing may still be running (check /cognee-index --wait).`
               : `No code facts for '${seed}' — the graph has no such symbol (an empty result, not an error).`),
-          { hits: result.items.length, dataset: resolved.dataset, resolvedVia: resolved.how },
+          { hits: hits.length, dataset: resolved.dataset, resolvedVia: resolved.how },
         );
       } catch (err) {
         return errResult("cognee_code failed", wrapAsCogneeError(err));
@@ -1252,7 +1366,7 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           `Cognee Memory — ${health.reachable ? "connected" : "offline"}`,
           `  Mode:      ${cfg.backend}${cfg.backendForced ? ` (forced by COGNEE_BACKEND=${cfg.backend})` : ""}${cfg.missingBaseUrl ? " — ✕ COGNEE_BASE_URL missing" : ""}`,
           `  Server:    ${cfg.baseUrl}${health.reachable ? ` — reachable in ${health.latencyMs}ms${health.version ? ` (v${health.version})` : ""}` : ` — unreachable: ${health.error ?? "unknown error"}`}`,
-          `  Dataset:   ${state.dataset}`,
+          `  Dataset:   ${state.dataset}${datasetSwitchSuffix()}`,
           `  Federation: ${federationStatusLine()}`,
           `  Session:   ${state.sessionId || "(not started)"}`,
           `  API key:   ${client.authSummary()}`,
@@ -1288,7 +1402,7 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           `  ${pad("Env file")}${cfg.envFilePath}${cfg.envFileExists ? ` (found, ${cfg.envFileKeys.length} keys${cfg.envFileKeys.length ? `: ${cfg.envFileKeys.join(", ")}` : ""})` : " (not found — created by the official plugins on first run, or add one yourself)"}`,
           `  ${pad("Shell env")}${cfg.shellOverrides.length ? cfg.shellOverrides.join(", ") : "(no COGNEE_*/LLM_* overrides)"}`,
           `  ${pad("LLM_API_KEY")}${cfg.llmApiKeyConfigured ? `configured${cfg.llmModel ? ` (model ${cfg.llmModel})` : ""} — required by a local cognee server` : "missing — required in local mode (the server, not this extension, needs it)"}`,
-          `  ${pad("Dataset")}${state.dataset}${cfg.dataset !== "agent_sessions" ? " (custom via COGNEE_PLUGIN_DATASET)" : " (default, shared with Claude Code/Codex plugins)"}`,
+          `  ${pad("Dataset")}${state.dataset} — ${datasetSourceLabel()}`,
           `  ${pad("Federation")}${federationStatusLine()}`,
           `  ${pad("Session")}${state.sessionId || "(not started)"}`,
           `  ${pad("Datasets")}${datasets.ok && datasets.datasets.length ? datasets.datasets.slice(0, 10).map((d) => `${d.name}${d.id ? ` (${d.id.slice(0, 8)}…)` : ""}`).join(", ") : datasets.ok ? "(none readable)" : `unavailable (${describeError(datasets.error)})`}`,
@@ -1526,7 +1640,9 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           report(ctx, `Code query failed: ${result.error?.message ?? "unknown error"}`, "error");
           return;
         }
-        const body = renderCodeItems(result.items);
+        // Same empty-envelope filter as the tool path: facts: [] is "no such symbol".
+        const hits = result.items.filter(codeItemHasData);
+        const body = renderCodeItems(hits);
         report(
           ctx,
           body ||
@@ -1563,6 +1679,194 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
         }
       } catch (err) {
         report(ctx, `Sync failed: ${describeError(err)}`, "error");
+      }
+    },
+  });
+
+  pi.registerCommand("cognee-datasets", {
+    description:
+      "List memory datasets / switch the active one: /cognee-datasets [<name>] [--force]",
+    handler: async (args, ctx) => {
+      // Re-entry guard (in-process analog of the reference .switch.lock): two
+      // overlapping invocations must not both mint __2 from the same base session.
+      if (state.switching) {
+        report(ctx, "A dataset switch is already in progress — wait for it to finish.", "warning");
+        return;
+      }
+      state.switching = true;
+      try {
+        const tokens = args.trim().split(/\s+/).filter(Boolean);
+        const force = tokens.includes("--force");
+        const positional = tokens.filter((t) => t !== "--force");
+        if (positional.length > 1) {
+          report(ctx, "Usage: /cognee-datasets [<name>] [--force] — dataset names never contain spaces.", "warning");
+          return;
+        }
+        const target = positional[0] ?? "";
+        const listed = await client.listDatasets();
+        if (!listed.ok) {
+          report(
+            ctx,
+            `Cannot list datasets: ${listed.error?.message ?? "unknown error"}` +
+              (listed.error?.unreachable || listed.error?.status === 0
+                ? " — server unreachable, run /cognee-doctor"
+                : ""),
+            "error",
+          );
+          return;
+        }
+        if (!target) {
+          report(ctx, renderDatasetList(state.dataset, state.sessionId, listed.datasets));
+          return;
+        }
+        // A Cognee session never spans two datasets: switching means syncing the
+        // session being left, minting a NEW session id for the target dataset,
+        // and repointing every lane (mirror of the reference switch-dataset flow,
+        // minus the agent-registry conn handles — accepted gap #4).
+        if (target === state.dataset) {
+          report(
+            ctx,
+            `Already active: '${target}' (session ${state.sessionId || "(not started)"}) — nothing to do.`,
+          );
+          return;
+        }
+        const match = matchDatasets(target, listed.datasets);
+        if (match.status === "ambiguous") {
+          report(
+            ctx,
+            `Ambiguous: '${target}' matches ${match.matches.length} datasets ` +
+              `(${match.matches.map((m) => `${m.name} ${m.id}`).join("; ")}) — select its UUID.`,
+            "error",
+          );
+          return;
+        }
+        let datasetName = match.status === "ok" ? match.matches[0].name || target : target;
+        if (match.status === "missing") {
+          // An unlisted name is CREATED on switch (the picker's free-typed "Other").
+          // Divergence vs the reference: single principal — every readable dataset
+          // is owned, hence writable; there is no permissions route to consult yet.
+          const ensured = await client.ensureDataset(target);
+          if (!ensured.ok) {
+            report(
+              ctx,
+              `Cannot switch to '${target}': not in the readable set and could not be created ` +
+                `(${ensured.error?.message ?? "unknown error"}) — pick from the list: /cognee-datasets`,
+              "error",
+            );
+            return;
+          }
+        }
+        datasetName = sanitizeDatasetName(datasetName);
+
+        // 1. Strict sync of the session being left — bounded (≤4s drain + ≤4s
+        //    improve, same budget as the final sync). Failure aborts unless
+        //    --force; the buffered queue is preserved either way and the
+        //    auto-sync/final-sync paths retry it (our analog of `touched`).
+        let synced = true;
+        let syncError = "";
+        if (state.sessionId) {
+          try {
+            if (state.writeQueue.length > 0) {
+              await drainWriteQueue({ force: true, deadline: Date.now() + FINAL_SYNC_TIMEOUT_MS });
+            }
+            if (state.capturedCount > 0) {
+              const improved = await client.improve(state.sessionId, state.dataset, FINAL_SYNC_TIMEOUT_MS);
+              if (improved.outcome === "error") {
+                synced = false;
+                syncError = improved.error?.message ?? "improve failed";
+              }
+            }
+          } catch (err) {
+            synced = false;
+            syncError = describeError(err);
+          }
+        }
+        if (!synced && !force) {
+          report(
+            ctx,
+            [
+              `Switch aborted: syncing the current session into '${state.dataset}' failed (${syncError}).`,
+              "The switch did NOT happen; buffered writes stay queued and the auto/final syncs retry.",
+              "Re-run with --force to switch anyway — the retired session keeps its own session-end sync.",
+            ].join("\n"),
+            "error",
+          );
+          return;
+        }
+
+        // 2. Mint the next ordinal session id (never collides, stays readable).
+        const newSessionId = sanitizeSessionId(
+          mintSwitchSessionId(state.sessionId || `${cfg.sessionPrefix}_${randomId()}`),
+        );
+        // 3. Repoint in memory …
+        const previous = { dataset: state.dataset, session_id: state.sessionId, synced };
+        const prevEnsured = state.datasetEnsured;
+        const prevSwitchFrom = state.datasetSwitchedFrom;
+        const prevSwitchAt = state.datasetSwitchedAt;
+        state.dataset = datasetName;
+        state.sessionId = newSessionId;
+        state.datasetEnsured = false;
+        state.datasetSource = "persisted switch";
+        state.datasetSwitchedFrom = previous.dataset;
+        state.datasetSwitchedAt = new Date().toISOString();
+
+        // 4. … persist atomically (tmp + rename), then read back and verify —
+        //    mismatch rolls back: "switch was not persisted; nothing was changed".
+        const record: ActiveDatasetRecord = {
+          base_url: cfg.baseUrl,
+          key_fp: client.keyFingerprint(),
+          dataset: datasetName,
+          session_id: newSessionId,
+          previous,
+          switched_at: state.datasetSwitchedAt,
+        };
+        const saved = saveActiveDatasetRecord(record);
+        const verify = saved.ok
+          ? loadActiveDatasetRecord(cfg.baseUrl, client.keyFingerprint())
+          : undefined;
+        if (!saved.ok || !verify || verify.dataset !== record.dataset || verify.session_id !== record.session_id) {
+          state.dataset = previous.dataset;
+          state.sessionId = previous.session_id;
+          state.datasetEnsured = prevEnsured;
+          state.datasetSource = cfg.datasetSource;
+          state.datasetSwitchedFrom = prevSwitchFrom;
+          state.datasetSwitchedAt = prevSwitchAt;
+          report(
+            ctx,
+            `Switch was not persisted${saved.error ? ` (${saved.error})` : ""} — nothing was changed; the previous session remains active.`,
+            "error",
+          );
+          return;
+        }
+
+        // 4b. A --force switch past a failed sync retired an unsynced session —
+        //     remember it so the session-end sync promotes its cache too (the
+        //     reference retries it via `touched`; ours retries at final sync).
+        if (!synced && previous.session_id) {
+          const alreadyTracked = state.retiredSessions.some((r) => r.sessionId === previous.session_id);
+          if (!alreadyTracked) {
+            state.retiredSessions.push({ sessionId: previous.session_id, dataset: previous.dataset });
+          }
+        }
+
+        // 5. Lanes re-pointed (capture/recall/sync/statusline read state.dataset);
+        //    the code lane and federation stay independent of the session dataset.
+        setStatusSafe(`● cognee: ${cfg.backend} · ${state.dataset}`);
+        void runHealthCheck({ notify: false }).catch(() => {}); // ensure + refresh state
+        report(
+          ctx,
+          [
+            `Switched to dataset '${state.dataset}' (session ${newSessionId}).`,
+            synced
+              ? `Previous session ${previous.session_id} synced into '${previous.dataset}'.`
+              : `Previous session NOT synced (--force) — its buffered writes stay bound to it and its session-end sync will retry.`,
+            `Recall is scoped to the active dataset: context from '${previous.dataset}' is no longer injected (switch back to see it again).`,
+          ].join("\n"),
+        );
+      } catch (err) {
+        report(ctx, `Dataset switch failed: ${describeError(err)}`, "error");
+      } finally {
+        state.switching = false;
       }
     },
   });
@@ -1689,9 +1993,17 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
         /* no host session id yet — fall back to a random suffix */
       }
       state.sessionId = sanitizeSessionId(
-        cfg.sessionIdOverride ?? `${cfg.sessionPrefix}_${hostId || randomId()}`,
+        cfg.sessionIdOverride ??
+          // A persisted switch is the session affinity: pi has no stable host
+          // session id across processes, so the record's session id is adopted
+          // and a resumed conversation keeps bridging into the switched session.
+          cfg.switchSessionId ??
+          `${cfg.sessionPrefix}_${hostId || randomId()}`,
       );
       state.dataset = cfg.dataset;
+      state.datasetSource = cfg.datasetSource;
+      state.datasetSwitchedFrom = cfg.datasetSwitchedFrom ?? null;
+      state.datasetSwitchedAt = cfg.datasetSwitchedAt ?? null;
       state.hasUI = ctx.hasUI;
       state.ui = ctx.ui;
       state.cwd = ctx.cwd || process.cwd();
@@ -1766,18 +2078,29 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
         }),
         lane
           ? client.codeSearch({
-              seed: lane.identifier,
+              // Reference wire shape (session-context-lookup.py _dispatch, verified
+              // against the live server — research/findings-codelane.md §1): the FULL
+              // prompt is the query (the default-explore fallback seed — NOT the
+              // identifier), the identifier rides in code_query.name, top_k is the
+              // reference TOP_K=5, the dataset is the repo's own from index state,
+              // and the session id is attached on the code scope too.
+              seed: redactSecrets(prompt),
               codeQuery: lane.codeQuery,
               dataset: lane.dataset,
               topK: 5,
+              sessionId: state.sessionId,
               timeoutMs: Math.min(2000, cfg.recallTimeoutMs),
             })
           : Promise.resolve(null),
       ]);
+      // The server does not answer "no results" for an unresolvable code seed —
+      // it returns ONE entry whose text IS the raw envelope
+      // ("{\"operation\": \"query_facts\", \"facts\": [], …}"). Filter empty
+      // envelopes before counting hits, or the lane injects that JSON as a
+      // "fact" (the observed empty-lane bug). Non-JSON prose hits pass through.
+      const codeFacts = codeResult?.ok ? codeResult.items.filter(codeItemHasData) : [];
       const codeSection =
-        codeResult && codeResult.ok && codeResult.items.length > 0
-          ? renderCodeFacts(codeResult.items, CODE_LANE_MAX_CHARS)
-          : "";
+        codeFacts.length > 0 ? renderCodeFacts(codeFacts, CODE_LANE_MAX_CHARS) : "";
       if (!result.ok) {
         recordFailure(result.error);
         if (result.error?.status === 401 || result.error?.status === 403) {
@@ -1798,7 +2121,8 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
         if (result.items.length > 0) state.turnsWithHits++;
         const statsLine = `Cognee memory: ${result.items.length} memory hits · ${state.turnsWithHits}/${state.totalRecallTurns} turns had hits this session`;
         const block = renderContextBlock(result.items, cfg.contextMaxChars, statsLine);
-        const content = [block, codeSection].filter(Boolean).join("\n\n");
+        // Reference order: the code section renders FIRST, before the memory block.
+        const content = [codeSection, block].filter(Boolean).join("\n\n");
         if (content) {
           return { message: { customType: "cognee_memory", content, display: false } };
         }

@@ -174,6 +174,7 @@ effectively ignored on the forced-local path — only `COGNEE_LOCAL_API_URL` is 
 | `/cognee-doctor` | Diagnose: mode + why, env file and shell overrides, API key source, reachability + latency + version, dataset list, federation state, breaker, timeouts, code graph |
 | `/cognee-remember <text>` | Store text in the graph. `--file <path>` ingests one file (≤200 KB, text-only) **verbatim under its real filename** — code extensions route down the zero-LLM code-graph path (single file, no cross-file edges; use `/cognee-index` for those). `--node-set user_context\|project_docs\|agent_actions` picks the memory category. Waits briefly for cognify |
 | `/cognee-search <query>` | Explicit graph search. `--top-k N`, `--dataset <name>` |
+| `/cognee-datasets [name] [--force]` | List memory datasets (reference picker format, active one starred) or **switch the active dataset**: syncs the current session into the dataset being left (abort on failure unless `--force`), validates/creates the target, mints a new session id (`pi_<session>__2`, `__3`…), re-points capture/recall/sync/statusline, and persists the switch to `~/.cognee-plugin/pi/active-dataset.json` so it survives restarts and beats the `COGNEE_PLUGIN_DATASET` seed. Unlisted names are created on switch; recall is scoped to the active dataset (context from the previous one stops being injected — switch back to see it). A one-off *look* in another dataset needs no switch: `/cognee-search <query> --dataset <name>` |
 | `/cognee-index [path\|git-url]` | Index a repo into the code graph (cognee ≥ 1.5.4). `--dataset <name>`, `--index-vectors` (embed code facts for semantic search), `--wait <seconds>` (poll until queryable). Default dataset `codebase-<repo>-<digest>`, printed on success. Local paths need a server sharing this filesystem (cloud servers reject them — pass a git URL; the command warns) |
 | `/cognee-code <seed> \| '<operation-json>'` | Query the current repo's code graph: a plain word is a seed (exact/suffix/substring); or an exact operation — `{"operation":"impact_analysis","targets":["process_payment"]}`, `query_facts` (e.g. `kind:"route"` lists endpoints), `explore`, `traverse`, `find_path`, `delta` (what the last index changed). `--dataset <name>`, `--top-k N` |
 | `/cognee-sync` | Promote this session's cache into the permanent graph (manual, ignores nothing) |
@@ -238,8 +239,22 @@ printf '\n.enola/\n' >> .gitignore
 **Code recall lane.** Once a repo is indexed from its checkout, the per-prompt memory recall
 adds a `code` lane automatically when the prompt mentions an identifier-shaped token
 (`process_payment`, `UserService`, `billing/api.py`) — the facts appear as a bounded
-`=== Code graph facts ===` section (1000-char hard cap). The lane runs concurrently with the
-graph recall inside the same recall budget, so it can never add latency beyond it.
+`=== Code graph facts ===` section (1000-char hard cap) rendered **before** the memory block.
+The lane sends exactly what the official plugins' auto lane sends (verified against the
+reference source and a live server): `scope=["code"]`, `top_k=5`, the full prompt as the
+query, `code_query = {operation: "query_facts", name: <identifier>, limit: 5}`, the session
+id, and the repo's own dataset from index state. It runs concurrently with the graph recall
+inside the same recall budget, so it can never add latency beyond it. Two behaviors worth
+knowing:
+
+- **Empty results are never injected.** For a symbol the graph cannot resolve, the server
+  returns a single envelope entry (`{"operation": "query_facts", "facts": [], …}`) — it is
+  filtered out before counting hits, so the lane stays silent instead of injecting raw JSON
+  (v0.1 injected it; fixed in v0.2). The explicit `cognee_code` tool applies the same filter.
+- **Closure-nested symbols are invisible to the graph.** The enola indexer records
+  module-level declarations and class members — a function nested *inside* another function
+  (like the helpers inside this extension's factory) has no fact, so prompts naming one
+  legitimately find nothing. Flat files and classes are the coverage unit.
 
 ## Tools (model-facing)
 
@@ -287,7 +302,7 @@ passes through `LLM_API_KEY` / `LLM_MODEL` for a local server (reported by `/cog
 | `COGNEE_USER_EMAIL` / `COGNEE_USER_PASSWORD` | `default_user@example.com` / `default_password` | Login credentials for the local owner-key auto-mint (must match the server's `DEFAULT_USER_*`) |
 | `COGNEE_BACKEND` / `COGNEE_PI_BACKEND` | auto | Pin `local` or `cloud` |
 | `COGNEE_LOCAL_API_URL` | `http://localhost:8011` | Local server URL |
-| `COGNEE_PLUGIN_DATASET` | `agent_sessions` | Graph dataset — set per project for scoped memory; the default is shared with the Claude Code/Codex plugins |
+| `COGNEE_PLUGIN_DATASET` | `agent_sessions` | **Seed** for the graph dataset — set per project for scoped memory; the default is shared with the Claude Code/Codex plugins. Once `/cognee-datasets <name>` switched datasets, the persisted record wins over this seed (switch back or delete `~/.cognee-plugin/pi/active-dataset.json` to re-seed) |
 | `COGNEE_PLUGIN_READ_DATASET_IDS` | — | JSON array of dataset **UUIDs** for federated **graph recall** (read-only federation; see [Federated reads](#federated-reads-cognee_plugin_read_dataset_ids)) |
 | `COGNEE_SESSION_PREFIX` / `COGNEE_SESSION_ID` | `pi` / auto | Cognee session id (`pi_<pi session id>`) |
 | `COGNEE_CAPTURE` | `true` | Master switch for auto-capture + auto-recall |
@@ -305,6 +320,7 @@ passes through `LLM_API_KEY` / `LLM_MODEL` for a local server (reported by `/cog
 | `COGNEE_BREAKER_THRESHOLD/WINDOW_MS/COOLDOWN_MS` | `5` / `300000` / `120000` | Circuit breaker (only unreachable/5xx count) |
 | `COGNEE_BREAKER_FILE` | `~/.cognee-plugin/pi/breaker.json` | Cross-process breaker state file (open-until + consecutive-failure count, keyed by server URL) |
 | `COGNEE_CODE_STATE_DIR` | `~/.cognee-plugin/pi/code-graph/` | Per-repo index-state directory (dataset + fingerprint + last status; override for tests) |
+| `COGNEE_PI_STATE_DIR` | `~/.cognee-plugin/pi` | Directory holding the persisted dataset-switch record (`active-dataset.json`, keyed by server URL + API-key fingerprint; override for tests) |
 | `COGNEE_CODE_AUTOINDEX` | `auto` | Code-graph auto-indexing of new repos: `auto` (loopback server only), `always` (any server), `off`. `COGNEE_CAPTURE=false` disables it as part of all automation |
 | `COGNEE_CODE_INDEX_TIMEOUT_MS` | `120000` | Repo-index submit timeout (background pipelines confirm slowly; a timeout is not retried blindly — the submission may have landed) |
 
@@ -361,18 +377,18 @@ Find dataset UUIDs with `/cognee-forget` (it lists datasets with their ids) or t
 | Code graph: repo indexing (`content_type="code"`, `codebase-<repo>-<digest>` datasets, `--index-vectors`, `--wait` poll) | ✅ | ✅ same wire format |
 | Code graph: deterministic queries (query_facts, explore, traverse, find_path, impact_analysis, delta) | ✅ | ✅ via `cognee_code` / `/cognee-code` (POST `/api/v1/recall` scope `code` + `code_query`) |
 | Code graph: session-start auto-index + 3000-file cap + freshness fingerprint/re-index | ✅ detached hooks | ✅ in-process, debounced, fail-soft |
-| Code graph: identifier-shaped code recall lane (`=== Code graph facts ===`) | ✅ | ✅ concurrent lane, 1000-char cap, same recall budget |
+| Code graph: identifier-shaped code recall lane (`=== Code graph facts ===`) | ✅ | ✅ reference wire shape (code_query attached, prompt as query, session id, top_k 5), empty-result envelopes filtered, 1000-char cap, same recall budget |
 | Per-file code ingestion (`--file`, real filename → zero-LLM code route, no cross-file edges) | ✅ `cognee-remember --file` | ✅ `cognee_remember file=` param + `/cognee-remember --file` (verbatim, guarded: exists/size/text-only/credential-path refusal) |
 | Pre-compact memory anchor (session-scoped graph recall + recent turns preserved) | ✅ PreCompact hook | ✅ `session_before_compact` → anchor stored into the session-cache tier |
 | Server bootstrap (uv venv, uvicorn, pinned version) | ✅ | ❌ deferred — run the server yourself |
 | Status text (`●/✕ cognee: mode · dataset` in pi's footer, health glyph + backend + dataset in every state) | ✅ | ✅ mode-guarded `ui.setStatus` at the health-probe points |
 | Rich statusline renderer (hit counts, credits, update glyph) | ✅ | ❌ deferred |
 | cognee-recall subagent | ✅ | ❌ deferred |
-| Dataset switcher | ✅ | ❌ deferred (per-call `dataset` overrides cover the basics) |
+| Dataset switcher | ✅ | ✅ `/cognee-datasets` — persisted record at `~/.cognee-plugin/pi/active-dataset.json` wins over the `COGNEE_PLUGIN_DATASET` seed across restarts (single-principal divergence: no permissions route, no conn-handle register/unregister) |
 | Idle watcher / exit watcher / detached final-sync worker | ✅ | ➖ bounded in-process equivalents |
 | Shared-agent-memory provisioning (`/provision`, tenants, roles) | ✅ | ❌ deferred — single principal key |
 
-**Consciously deferred** (v0.1.0) — see
+**Consciously deferred** (v0.2.0) — see
 [Differences from the Claude Code/Codex plugins](#differences-from-the-claude-codecodex-plugins)
 below for the full list of accepted gaps and deliberate behavioral divergences.
 
@@ -380,15 +396,18 @@ below for the full list of accepted gaps and deliberate behavioral divergences.
 
 pi-cognee speaks the same wire protocol and shares `~/.cognee/.env` (and the local owner-key
 cache) with the official plugins, so all three agents can share one memory. The gaps below are
-**accepted** for v0.1.0 — not implemented by design:
+**accepted** — not implemented by design:
 
 1. **Local server bootstrap** (uv venv, pinned cognee, detached uvicorn, single-flight locks,
    boot deadline) — run the server yourself; pi-cognee never starts or installs one.
 2. **Tool-call trace capture** (`PostToolUse` → trace entries, `COGNEE_CAPTURE_TOOLS` allowlist,
    sensitive-path deny list, `COGNEE_CAPTURE_REDACT_PATTERNS` extension) — capture is QA-pairs
    only; text-level redaction of prompts/answers **is** implemented.
-3. **Dataset switcher** (register-then-unregister session re-pointing); per-call `dataset`
-   overrides on remember/search/forget partially cover it.
+3. **Dataset switcher — implemented in v0.2.0** with two documented divergences: single
+   principal (every readable dataset is owned, hence writable — no permissions route until
+   shared-agent-memory lands, gap 4), and no conn-handle register-then-unregister dance (that
+   exists only for the reference's agent-mode server-count problem). Per-call `dataset`
+   overrides still cover one-off reads without switching.
 4. **Shared-agent-memory provisioning** (plugin identity `/provision`, tenant/role grants,
    `COGNEE_PLUGIN_IDENTITY` × `COGNEE_SHARED_AGENT_MEMORY`) — single principal key only.
 5. **Rich statusline renderer** (glyph states beyond the implemented ones, hit counts, credits
@@ -446,6 +465,37 @@ state, and all timeouts. Common cases:
   upgrade it and re-run `/cognee-index`.
 - **Code queries return empty on a cloud server** — the graph reflects the last *pushed* commit;
   push, then re-run `/cognee-index <git-url>` (see [Code graph](#code-graph)).
+
+## Changelog
+
+### v0.2.0
+
+- **Auto code-recall lane fix** — the lane was verified reference-identical on the wire
+  (research/findings-codelane.md), but its discharge counted the server's *empty-result
+  envelope* (`{"operation": "query_facts", "facts": [], "total": 0}`) as a hit and injected
+  the raw JSON into the prompt — the "empty code facts" bug. Empty envelopes are now
+  filtered before counting hits (`codeItemHasData`), in both the auto lane and the explicit
+  `cognee_code` tool/command (which now falls through to its "No code facts for X" warning).
+  The lane also now sends the reference's literal request shape (full prompt as query,
+  session id attached on the code scope, `top_k=5`, repo dataset from index state,
+  `code_query` attached) and renders the code section **before** the memory block, matching
+  the reference's order. Documented: closure-nested symbols are invisible to the enola graph.
+- **Dataset switcher** — `/cognee-datasets` lists datasets (reference picker format) and
+  `/cognee-datasets <name>` switches: strict pre-switch sync (abort unless `--force`),
+  validate/ensure the target (ambiguous names refused; unlisted names created on switch),
+  ordinal session-id minting (`pi_<session>__2`, `__3`, …), atomic persist + read-back verify
+  with rollback ("nothing was changed"), and a record at
+  `~/.cognee-plugin/pi/active-dataset.json` keyed by server URL + key fingerprint that wins
+  over the `COGNEE_PLUGIN_DATASET` seed across restarts (session affinity). Switch provenance
+  shows in `/cognee`, `/cognee-doctor` (source + state-file path), and the statusline. The
+  code lane and federated reads stay independent of the session dataset.
+- Parity triage of cognee 1.6's new endpoints (research/v02-spec.md §2): none are
+  reference-parity-relevant — all parked.
+
+### v0.1.0
+
+Initial release: two-tier memory, auto capture/recall, federation, code graph, forget flow,
+circuit breaker, pre-compact anchor, per-file code ingestion.
 
 ## Development
 
