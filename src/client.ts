@@ -722,6 +722,8 @@ export interface CodeRepoState {
   fingerprint: string;
   last_index_at: number;
   last_status?: string;
+  /** Epoch ms when `last_status` was last observed (terminal write-back from a poll). */
+  last_status_at?: number;
   error_count?: number;
   last_error_at?: number;
   last_error?: string;
@@ -1102,6 +1104,74 @@ export interface RememberParams {
   background?: boolean;
   timeoutMs?: number;
   externalSignal?: AbortSignal;
+}
+
+/** How a remember() call landed. "stored" = plain POST add (or fallback after a
+ *  discovery failure); "updated" = the existing data item was PATCHed (delta
+ *  re-ingestion, chunk-level diff server-side); "unchanged" = content hash-
+ *  identical to the stored copy — nothing was sent. Only the explicit-filename
+ *  (real file upload) lane can produce "updated"/"unchanged"; prose memories
+ *  use timestamped synthetic names and stay append-only by design. */
+export type RememberOutcome = "stored" | "updated" | "unchanged";
+
+/** Structured outcome of the update path (PATCH /api/v1/update). */
+export interface RememberUpdateInfo {
+  /** Server status: incremental | unchanged | full_rebuild ("failed" returns ok:false). */
+  status: string;
+  /** One compact line for humans: "+3/−1 chunks, 12 kept" / "memory dropped and rebuilt (fallback: …)". */
+  detail: string;
+}
+
+export interface RememberResult {
+  ok: boolean;
+  status?: number;
+  outcome?: RememberOutcome;
+  datasetId?: string;
+  /** The data item's UUID (update/unchanged paths) — the handle for a targeted forget. */
+  dataId?: string;
+  pipelineRunId?: string;
+  update?: RememberUpdateInfo;
+  error?: CogneeError;
+}
+
+/** `error` string from an UpdateResult/ErrorResponse body, when present (lenient). */
+function errorStringFromUpdateBody(data: Record<string, unknown>): string | undefined {
+  if (typeof data.error === "string" && data.error) return data.error; // ErrorResponse
+  const err = data.error;
+  if (err && typeof err === "object" && typeof (err as { message?: unknown }).message === "string") {
+    return (err as { message: string }).message; // UpdateResult.error
+  }
+  return undefined;
+}
+
+/** One compact human line for an UpdateResult: "+3/−1 chunks, 12 kept"
+ *  (incremental), "no content change" (unchanged), or "memory dropped and
+ *  rebuilt (fallback: <reason>)" — counters are null on a rebuild by contract. */
+function updateSummaryLine(data: Record<string, unknown>): string {
+  const status = String(data.status ?? "");
+  const num = (key: string): number | null => {
+    const v = data[key];
+    return typeof v === "number" && Number.isFinite(v) ? v : null;
+  };
+  const fallback = data.fallback;
+  const reason =
+    fallback && typeof fallback === "object" && typeof (fallback as { reason?: unknown }).reason === "string"
+      ? (fallback as { reason: string }).reason
+      : "";
+  if (status === "unchanged") return "no content change";
+  if (status === "full_rebuild") {
+    return `memory dropped and rebuilt${reason ? ` (fallback: ${reason})` : ""}`;
+  }
+  const parts: string[] = [];
+  const added = num("added_chunks");
+  const deleted = num("deleted_chunks");
+  if (added !== null || deleted !== null) parts.push(`+${added ?? 0}/−${deleted ?? 0} chunks`);
+  const kept = num("kept_chunks");
+  if (kept !== null) parts.push(`${kept} kept`);
+  const reused = num("reused_chunks");
+  if (reused !== null && reused > 0) parts.push(`${reused} reused`);
+  if (reason) parts.push(`fallback: ${reason}`);
+  return parts.join(", ") || status;
 }
 
 export type ImproveOutcome = "ok" | "busy" | "unsupported" | "error";
@@ -1503,16 +1573,20 @@ export class CogneeClient {
    * server routes it through the prose LLM pipeline (code extensions go the zero-LLM route).
    * run_in_background defaults to cfg.rememberBackground (COGNEE_REMEMBER_BACKGROUND —
    * set false for a synchronous, immediately-queryable write, like the reference).
+   *
+   * Update-when-changed (v0.3): when `filename` is EXPLICITLY set (a real file upload,
+   * never the synthetic prose timestamp), the client first discovers the data item
+   * previously ingested under that basename and either no-ops (identical bytes) or
+   * PATCHes it (chunk-level diff server-side) instead of adding a duplicate. Every
+   * discovery failure degrades to the plain add below — see updateExistingFileIfChanged.
    */
-  async remember(params: RememberParams): Promise<{
-    ok: boolean;
-    status?: number;
-    datasetId?: string;
-    pipelineRunId?: string;
-    error?: CogneeError;
-  }> {
+  async remember(params: RememberParams): Promise<RememberResult> {
     try {
       await this.ensureAuth(); // no-op once a key is resolved (or off-loopback)
+      if (params.filename) {
+        const delta = await this.updateExistingFileIfChanged(params);
+        if (delta) return delta; // handled (unchanged / updated / hard error)
+      }
       const form = new FormData();
       form.set("node_set", params.nodeSet ?? "user_context");
       form.set("run_in_background", String(params.background ?? this.cfg.rememberBackground));
@@ -1560,8 +1634,213 @@ export class CogneeClient {
       return {
         ok: true,
         status: resp.status,
+        outcome: "stored",
         datasetId: data?.dataset_id ?? data?.datasetId,
         pipelineRunId: data?.pipeline_run_id,
+      };
+    } catch (err) {
+      return { ok: false, error: wrapAsCogneeError(err) };
+    }
+  }
+
+  /**
+   * Update-when-changed for an explicit-filename remember (v0.3): discover the
+   * data item previously ingested under this basename (exact `name` match,
+   * latest `createdAt` on same-name twins), compare content hashes statelessly,
+   * and either no-op (identical), PATCH /api/v1/update (changed — chunk-level
+   * diff server-side), or signal the caller to fall back to a plain add
+   * (returns undefined: dataset/item listing failed, name never ingested, or
+   * the item vanished mid-flight — the 404 race with forget). A FAILED update
+   * returns ok:false WITHOUT a plain-add fallback: the document still exists,
+   * and a duplicate add would corrupt its identity. Never throws.
+   */
+  private async updateExistingFileIfChanged(params: RememberParams): Promise<RememberResult | undefined> {
+    try {
+      if (!params.filename) return undefined;
+      // 1. Dataset UUID — the data-item routes are UUID-addressed. A UUID-shaped
+      //    dataset value (datasetId or dataset) is used as-is; a plain name is
+      //    resolved via one extra GET. A NAME-shaped datasetId addresses
+      //    datasetName — the explicit dataset param wins over it (mirrors
+      //    write_fields()' routing; no caller mixes them today, defensive).
+      const dsParam = canonicalUuid(params.datasetId ?? "")
+        ? params.datasetId
+        : params.dataset ?? params.datasetId;
+      let datasetId = canonicalUuid(dsParam ?? "");
+      if (!datasetId && dsParam) {
+        const listed = await this.listDatasets();
+        if (!listed.ok) return undefined; // discovery failed → fail open to a plain add
+        const hit = listed.datasets.find((d) => d.name === sanitizeDatasetName(dsParam!));
+        if (!hit?.id) return undefined; // name not on the server yet → plain add creates it
+        datasetId = canonicalUuid(hit.id);
+      }
+      if (!datasetId) return undefined;
+      // 2. Exact basename match; latest createdAt wins on same-name twins (the
+      //    hash compare below is the safety net — identical content no-ops
+      //    regardless of which twin matched).
+      const items = await this.listDataItems(datasetId);
+      if (!items.ok) return undefined;
+      const matches = items.items.filter((i) => i.name === params.filename && canonicalUuid(i.id));
+      if (matches.length === 0) return undefined; // never ingested under this name → plain add
+      let item = matches[0];
+      for (const m of matches) {
+        if ((m.created_at ?? "") >= (item.created_at ?? "")) item = m; // ISO sort, ties → last
+      }
+      const dataId = canonicalUuid(item.id);
+      // 3. Stateless content compare: identical bytes → authoritative no-op
+      //    (nothing sent). Raw unreadable/shape-mismatch → treat as changed; the
+      //    server-side "unchanged" status is the backstop.
+      const localHash = createHash("sha256").update(params.content, "utf8").digest("hex");
+      const raw = await this.getDataItemRaw(datasetId, dataId);
+      if (raw.ok && createHash("sha256").update(raw.text, "utf8").digest("hex") === localHash) {
+        return {
+          ok: true,
+          outcome: "unchanged",
+          dataId,
+          update: { status: "unchanged", detail: "identical to the stored copy" },
+        };
+      }
+      // 4. Changed → PATCH under the same data_id (server diffs chunks; falls
+      //    back to a delete+re-ingest transparently, also under the same id).
+      const update = await this.updateDataItem({
+        datasetId,
+        dataId,
+        content: params.content,
+        filename: params.filename,
+        externalSignal: params.externalSignal,
+      });
+      if (update.ok) {
+        return {
+          ok: true,
+          outcome: "updated",
+          datasetId: update.datasetId || datasetId,
+          dataId,
+          pipelineRunId: update.pipelineRunId,
+          update: { status: update.status ?? "update", detail: update.detail ?? "" },
+        };
+      }
+      if (update.vanished) return undefined; // raced with forget → plain add re-creates it
+      return { ok: false, outcome: "updated", error: update.error };
+    } catch {
+      return undefined; // discovery itself failed → plain add (fail open)
+    }
+  }
+
+  /**
+   * PATCH /api/v1/update — replace the stored content of one data item under
+   * its stable `data_id` (cognee 1.6.0): chunk_level_diff defaults true server-
+   * side, so the server diffs the new content against the stored text and
+   * either replaces only the affected chunks or transparently falls back to a
+   * full delete+re-ingest — both keep the data_id. `node_set` and
+   * `chunk_level_diff` are deliberately omitted (the document already belongs
+   * to its node set; the default diff behavior is what we want). Both ids are
+   * canonicalized BEFORE the request — a non-UUID never leaves the client (the
+   * 422 guard). No retry (a write). A 404 means the item vanished since
+   * discovery (race with forget) and is reported as vanished:true so the caller
+   * can fall back to a plain add. A 500 carries either an UpdateResult with
+   * status:"failed" or an ErrorResponse — parsed leniently either way.
+   */
+  async updateDataItem(params: {
+    datasetId: string;
+    dataId: string;
+    content: string;
+    filename: string;
+    timeoutMs?: number;
+    externalSignal?: AbortSignal;
+  }): Promise<{
+    ok: boolean;
+    status?: string;
+    datasetId?: string;
+    pipelineRunId?: string;
+    /** Compact human summary of the chunk counters / rebuild fallback. */
+    detail?: string;
+    /** 404 — data_id resolves to no document: fall back to a plain add. */
+    vanished?: boolean;
+    error?: CogneeError;
+  }> {
+    const dataId = canonicalUuid(params.dataId);
+    const datasetId = canonicalUuid(params.datasetId);
+    if (!dataId || !datasetId) {
+      return {
+        ok: false,
+        error: new CogneeError(
+          `update needs UUID data_id and dataset_id (got data_id '${params.dataId}', dataset_id '${params.datasetId}')`,
+        ),
+      };
+    }
+    try {
+      await this.ensureAuth();
+      const form = new FormData();
+      // Same Blob+basename construction as the remember file lane: the part's
+      // filename is the loader-routing signal (code extensions stay code).
+      form.set("data", new Blob([params.content], { type: "text/plain" }), params.filename);
+      const resp = await this.rawFetch(
+        `${this.cfg.baseUrl}/api/v1/update?data_id=${dataId}&dataset_id=${datasetId}`,
+        {
+          method: "PATCH",
+          headers: this.authHeaders(),
+          body: form,
+          timeoutMs: params.timeoutMs ?? this.cfg.requestTimeoutMs,
+          externalSignal: params.externalSignal,
+        },
+      );
+      const text = await resp.readText();
+      let data: Record<string, unknown> | undefined;
+      try {
+        data = text ? (JSON.parse(text) as Record<string, unknown>) : undefined;
+      } catch {
+        data = undefined;
+      }
+      if (data && typeof data === "object" && data.status === "failed") {
+        // "failed" rides a 200 OR a 500 body (the spec documents both) — the
+        // rebuild's cognify run errored; retryable, and the document still exists.
+        const errObj = data.error as { message?: unknown } | undefined;
+        const message =
+          errObj && typeof errObj === "object" && typeof errObj.message === "string" && errObj.message
+            ? errObj.message
+            : "the rebuild's cognify run errored";
+        return {
+          ok: false,
+          error: new CogneeError(
+            `update failed server-side: ${message} — retryable; the document still exists (re-run the same remember to retry)`,
+          ),
+        };
+      }
+      if (resp.status === 404) {
+        return {
+          ok: false,
+          vanished: true,
+          error: new CogneeError(`HTTP 404 PATCH /api/v1/update: ${String(text).slice(0, 200) || "data item no longer exists"}`, {
+            status: 404,
+          }),
+        };
+      }
+      if (!resp.ok) {
+        const detail =
+          (data && typeof data === "object" ? errorStringFromUpdateBody(data) : undefined) ??
+          String(text).slice(0, 300);
+        return {
+          ok: false,
+          error: new CogneeError(`HTTP ${resp.status} PATCH /api/v1/update: ${detail}`, {
+            status: resp.status,
+          }),
+        };
+      }
+      if (!data || typeof data !== "object" || typeof data.status !== "string" || !data.status) {
+        // A 2xx the caller cannot parse is NOT success — the outcome is unknown,
+        // and the document may already be updated (never silently re-add).
+        return {
+          ok: false,
+          error: new CogneeError("malformed JSON response from PATCH /api/v1/update"),
+        };
+      }
+      const status = data.status;
+      const known = status === "incremental" || status === "unchanged" || status === "full_rebuild";
+      return {
+        ok: true,
+        status,
+        datasetId: typeof data.dataset_id === "string" ? data.dataset_id : datasetId,
+        pipelineRunId: typeof data.pipeline_run_id === "string" ? data.pipeline_run_id : undefined,
+        detail: known ? updateSummaryLine(data) : String(status),
       };
     } catch (err) {
       return { ok: false, error: wrapAsCogneeError(err) };

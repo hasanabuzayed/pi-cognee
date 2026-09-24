@@ -34,6 +34,7 @@ import {
   isUuid,
   loadActiveDatasetRecord,
   loadCogneeConfig,
+  loadRepoStates,
   loadSharedBreaker,
   matchDatasets,
   mintSwitchSessionId,
@@ -878,6 +879,12 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
     signal?: AbortSignal,
     pipeline: "cognify_pipeline" | "code_graph_pipeline" = "cognify_pipeline",
     intervalMs = 1500,
+    /** Invoked exactly once, right before returning, when the poll observed a
+     *  terminal status (suffix-matched, case-insensitive — servers report
+     *  prefixed forms). Never invoked on abort/stop/budget-expiry (non-terminal:
+     *  the pipeline is still running). Fail-soft: a throwing callback cannot
+     *  change the poll's return value. */
+    onTerminal?: (status: "COMPLETED" | "ERRORED" | "FAILED") => void,
   ): Promise<string> {
     const deadline = Date.now() + budgetMs;
     while (Date.now() < deadline && !signal?.aborted && !state.stopped) {
@@ -886,8 +893,21 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
         // Case-insensitive, suffix match (same as the reference pollers): servers
         // report "completed"/"COMPLETED"/prefixed forms alike.
         const s = (result.status ?? "").toUpperCase();
-        if (s.endsWith("COMPLETED")) return "graph is queryable";
-        if (s.endsWith("ERRORED")) return "pipeline ERRORED — data stored, but graph build failed";
+        if (s.endsWith("COMPLETED")) {
+          try { onTerminal?.("COMPLETED"); } catch { /* fail-soft */ }
+          return "graph is queryable";
+        }
+        if (s.endsWith("ERRORED")) {
+          try { onTerminal?.("ERRORED"); } catch { /* fail-soft */ }
+          return "pipeline ERRORED — data stored, but graph build failed";
+        }
+        if (s.endsWith("FAILED")) {
+          // Defensive terminal class: not in the 1.6.0 PipelineRunStatus enum, but
+          // a FAILED pipeline is just as terminal as an ERRORED one — polling on
+          // can only burn the budget.
+          try { onTerminal?.("FAILED"); } catch { /* fail-soft */ }
+          return "pipeline FAILED — data stored, but graph build failed";
+        }
       }
       // Abort-aware poll sleep, registered in state.timers so shutdown clears it.
       await new Promise<void>((resolve) => {
@@ -923,8 +943,10 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
       "worth recalling in future sessions — or asks you to remember/save/note something. " +
       "Per-file ingestion: pass file=<path> (instead of content) to upload one file from disk under its REAL " +
       "filename — a .py/.ts/... upload routes down the server's zero-LLM code path into the code graph " +
-      "(single file only, no cross-file edges — index the repo for those). The file must exist, be text, " +
-      "fit the size cap, and not look like a credential (~/.ssh, *.pem, .env, id_rsa*, credentials* are refused). " +
+      "(single file only, no cross-file edges — index the repo for those). Re-ingesting a file whose content " +
+      "changed UPDATES the stored item (chunk-level diff, same data_id) instead of adding a duplicate; identical " +
+      "content sends nothing. The file must exist, be text, fit the size cap, and not look like a credential " +
+      "(~/.ssh, *.pem, .env, id_rsa*, credentials* are refused). " +
       "WHEN NOT to use: ordinary conversation turns are auto-captured into session memory already; " +
       "do not remember transient details or secrets. " +
       "Choose node_set: user_context (preferences, instructions about the user), project_docs (architecture, " +
@@ -980,9 +1002,34 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
             externalSignal: signal,
           });
           if (!result.ok) return errResult("cognee_remember failed", result.error);
+          // Update-when-changed (v0.3): identical content sends nothing; a changed
+          // file PATCHes the stored data item instead of adding a duplicate.
+          if (result.outcome === "unchanged") {
+            return textResult(
+              `File '${read.basename}' unchanged (identical to the stored copy, data_id ${result.dataId}) — nothing sent.`,
+              { dataset, nodeSet, filename: read.basename, outcome: "unchanged", dataId: result.dataId },
+            );
+          }
           let suffix = "";
           if (result.datasetId) {
             suffix = ` ${await waitForCognify(result.datasetId, cfg.rememberWaitMs, signal)}`;
+          }
+          if (result.outcome === "updated") {
+            const note = result.update
+              ? `${result.update.status}${result.update.detail ? `: ${result.update.detail}` : ""}`
+              : "update sent";
+            return textResult(
+              `Updated file '${read.basename}' in dataset '${dataset}' (node_set: ${nodeSet}) — ${note} — ` +
+                `the data item kept its identity (no duplicate created).${suffix}`,
+              {
+                dataset,
+                nodeSet,
+                filename: read.basename,
+                outcome: "updated",
+                dataId: result.dataId,
+                datasetId: result.datasetId,
+              },
+            );
           }
           return textResult(
             `Stored file '${read.basename}' (${read.bytes} bytes) in dataset '${dataset}' (node_set: ${nodeSet}) — ` +
@@ -1470,8 +1517,24 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           report(ctx, `Remember failed: ${result.error?.message ?? "unknown error"}${result.error?.unreachable ? ` — is the cognee server running at ${cfg.baseUrl}?` : ""}`, "error");
           return;
         }
+        // Update-when-changed (v0.3, file uploads only): identical content sends
+        // nothing; a changed file PATCHes the stored data item (no duplicate).
+        if (result.outcome === "unchanged") {
+          report(ctx, `File '${filename}' unchanged (identical to the stored copy, data_id ${result.dataId}) — nothing sent.`);
+          return;
+        }
         let suffix = "";
         if (result.datasetId) suffix = ` ${await waitForCognify(result.datasetId, cfg.rememberWaitMs)}`;
+        if (result.outcome === "updated") {
+          const note = result.update
+            ? `${result.update.status}${result.update.detail ? `: ${result.update.detail}` : ""}`
+            : "update sent";
+          report(
+            ctx,
+            `Updated file '${filename}' in '${state.dataset}' (node_set ${nodeSet}) — ${note} — the data item kept its identity (no duplicate created).${suffix}`,
+          );
+          return;
+        }
         report(
           ctx,
           isFileUpload
@@ -1574,6 +1637,32 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
             undefined,
             "code_graph_pipeline",
             3000,
+            (status) => {
+              // Fail-soft terminal write-back (stale-last_status fix): the poll
+              // is dataset-scoped, so join on the dataset this submission just
+              // recorded — NOT findIndexedRepo (cwd containment), which
+              // /cognee-index <anywhere> need not satisfy. Prefer the state
+              // file whose spec is this repo — a deliberate --dataset reuse
+              // across two repos must not land the terminal status on the
+              // other repo's file (same-dataset fallback: most recent index).
+              try {
+                const canonical = canonicalRepoSpec(resolvedSpec);
+                const sameDataset = loadRepoStates().filter((r) => r.dataset === usedDataset);
+                const repo =
+                  sameDataset.find((r) => r.spec === canonical) ??
+                  sameDataset.reduce<CodeRepoState | undefined>(
+                    (latest, r) =>
+                      !latest || (r.last_index_at ?? 0) >= (latest.last_index_at ?? 0) ? r : latest,
+                    undefined,
+                  );
+                if (!repo) return;
+                repo.last_status = status;
+                repo.last_status_at = Date.now();
+                saveRepoState(repo);
+              } catch {
+                /* fail-soft — state is an optimization, never a source of truth */
+              }
+            },
           );
           lines.push(`  Wait:            ${outcome}`);
         } else {

@@ -172,9 +172,9 @@ effectively ignored on the forced-local path — only `COGNEE_LOCAL_API_URL` is 
 |---|---|
 | `/cognee` | Status: health + latency, mode, dataset, federation state, session, API key source, capture/auto settings, recall hits, queue, breaker, code-graph state |
 | `/cognee-doctor` | Diagnose: mode + why, env file and shell overrides, API key source, reachability + latency + version, dataset list, federation state, breaker, timeouts, code graph |
-| `/cognee-remember <text>` | Store text in the graph. `--file <path>` ingests one file (≤200 KB, text-only) **verbatim under its real filename** — code extensions route down the zero-LLM code-graph path (single file, no cross-file edges; use `/cognee-index` for those). `--node-set user_context\|project_docs\|agent_actions` picks the memory category. Waits briefly for cognify |
+| `/cognee-remember <text>` | Store text in the graph. `--file <path>` ingests one file (≤200 KB, text-only) **verbatim under its real filename** — code extensions route down the zero-LLM code-graph path (single file, no cross-file edges; use `/cognee-index` for those). Re-ingesting a changed file **updates** the stored item (chunk-level diff, same `data_id`) instead of duplicating it; identical content sends nothing. `--node-set user_context\|project_docs\|agent_actions` picks the memory category. Waits briefly for cognify |
 | `/cognee-search <query>` | Explicit graph search. `--top-k N`, `--dataset <name>` |
-| `/cognee-datasets [name] [--force]` | List memory datasets (reference picker format, active one starred) or **switch the active dataset**: syncs the current session into the dataset being left (abort on failure unless `--force`), validates/creates the target, mints a new session id (`pi_<session>__2`, `__3`…), re-points capture/recall/sync/statusline, and persists the switch to `~/.cognee-plugin/pi/active-dataset.json` so it survives restarts and beats the `COGNEE_PLUGIN_DATASET` seed. Unlisted names are created on switch; recall is scoped to the active dataset (context from the previous one stops being injected — switch back to see it). A one-off *look* in another dataset needs no switch: `/cognee-search <query> --dataset <name>` |
+| `/cognee-datasets [name] [--force]` | List memory datasets (reference picker format, active one starred) or **switch the active dataset**: syncs the current session into the dataset being left (abort on failure unless `--force`), validates/creates the target, mints a new session id (`pi_<session>__2`, `__3`…), re-points capture/recall/sync/statusline, and persists the switch to `~/.cognee-plugin/pi/active-dataset.json` so it survives restarts and beats the `COGNEE_PLUGIN_DATASET` seed. Unlisted names are created on switch; recall is scoped to the active dataset (context from the previous one stops being injected — switch back to see it; isolation is enforced by the server's `/recall` filters — see the v0.3.0 changelog note). A one-off *look* in another dataset needs no switch: `/cognee-search <query> --dataset <name>` |
 | `/cognee-index [path\|git-url]` | Index a repo into the code graph (cognee ≥ 1.5.4). `--dataset <name>`, `--index-vectors` (embed code facts for semantic search), `--wait <seconds>` (poll until queryable). Default dataset `codebase-<repo>-<digest>`, printed on success. Local paths need a server sharing this filesystem (cloud servers reject them — pass a git URL; the command warns) |
 | `/cognee-code <seed> \| '<operation-json>'` | Query the current repo's code graph: a plain word is a seed (exact/suffix/substring); or an exact operation — `{"operation":"impact_analysis","targets":["process_payment"]}`, `query_facts` (e.g. `kind:"route"` lists endpoints), `explore`, `traverse`, `find_path`, `delta` (what the last index changed). `--dataset <name>`, `--top-k N` |
 | `/cognee-sync` | Promote this session's cache into the permanent graph (manual, ignores nothing) |
@@ -260,7 +260,7 @@ knowing:
 
 | Tool | Use when… |
 |---|---|
-| `cognee_remember(content \| file, node_set?, dataset?)` | The user states a lasting preference, decision, convention, or fact — or asks you to remember something. `file` uploads one file from disk under its real filename (code extensions → zero-LLM code-graph route) |
+| `cognee_remember(content \| file, node_set?, dataset?)` | The user states a lasting preference, decision, convention, or fact — or asks you to remember something. `file` uploads one file from disk under its real filename (code extensions → zero-LLM code-graph route); a changed re-upload updates the stored item instead of duplicating it |
 | `cognee_recall(query, search_type?, session_only?, top_k?)` | Targeted memory lookup mid-task; `session_only=true` reads this session's raw Q&A cache |
 | `cognee_search(query, top_k?, dataset?, search_type?)` | Broad/exploratory graph search, cross-dataset (incl. memories written by the Claude Code / Codex plugins; federated reads apply when `COGNEE_PLUGIN_READ_DATASET_IDS` is set) |
 | `cognee_code(seed?, operation?, name?/start?/source?+target?/targets?/kind?/limit?/max_depth?/direction?, repo?, dataset?, top_k?)` | Structural code questions naming a symbol/file: callers of a seed, `impact_analysis` (what breaks if X changes), `find_path` (how A reaches B), `query_facts kind:"route"` (all endpoints), `explore`/`traverse`, `delta` (what the last index changed) — exact, instant, no tokens. Conceptual questions → `cognee_search` |
@@ -289,6 +289,22 @@ other agents. `--file` / `file=` uploads are stored **verbatim under the real fi
 (like the official plugins' `--file` path): the filename extension is the server's
 loader-routing signal, and redacting code would corrupt what the zero-LLM code path
 ingests — point the tool at code, not at secrets.
+
+**Update-when-changed on `--file` (v0.3).** A file upload is keyed by its basename in the
+target dataset: re-ingesting a file whose content changed PATCHes the stored data item
+(`PATCH /api/v1/update`, cognee ≥ 1.6.0) under the same `data_id` — the server re-ingests
+only the affected chunks and transparently falls back to a delete+re-ingest (same id) when
+chunk-level preconditions fail, so no duplicate items accumulate. Identical bytes are an
+authoritative no-op ("unchanged — nothing sent": no POST/PATCH is issued; the stateless
+content-hash compare against the stored text still performs its read-only discovery GETs —
+datasets, items, raw). Discovery is by exact filename match (latest `createdAt`
+wins on same-name twins — same-named files from different directories are a documented
+limitation); any discovery failure degrades to a plain add. A failed/errored update does
+**not** fall back to an add (the document still exists — a duplicate would corrupt its
+identity); a 404 (someone forgot the item mid-flight) does re-add. Prose memories
+(`content`) stay append-only — their synthetic names are timestamped by design. Repo
+code-graph indexing (`/cognee-index`) never uses this path: it submits whole-repo specs
+with no per-file `data_id` to update.
 
 ## Environment variables
 
@@ -379,6 +395,7 @@ Find dataset UUIDs with `/cognee-forget` (it lists datasets with their ids) or t
 | Code graph: session-start auto-index + 3000-file cap + freshness fingerprint/re-index | ✅ detached hooks | ✅ in-process, debounced, fail-soft |
 | Code graph: identifier-shaped code recall lane (`=== Code graph facts ===`) | ✅ | ✅ reference wire shape (code_query attached, prompt as query, session id, top_k 5), empty-result envelopes filtered, 1000-char cap, same recall budget |
 | Per-file code ingestion (`--file`, real filename → zero-LLM code route, no cross-file edges) | ✅ `cognee-remember --file` | ✅ `cognee_remember file=` param + `/cognee-remember --file` (verbatim, guarded: exists/size/text-only/credential-path refusal) |
+| Delta re-ingestion of changed files (`PATCH /api/v1/update`, chunk-level diff under a stable `data_id`) | ➖ not used by the reference | ✅ v0.3 — same-hash no-op, changed-hash update, exact-filename discovery; failed updates never duplicate-add |
 | Pre-compact memory anchor (session-scoped graph recall + recent turns preserved) | ✅ PreCompact hook | ✅ `session_before_compact` → anchor stored into the session-cache tier |
 | Server bootstrap (uv venv, uvicorn, pinned version) | ✅ | ❌ deferred — run the server yourself |
 | Status text (`●/✕ cognee: mode · dataset` in pi's footer, health glyph + backend + dataset in every state) | ✅ | ✅ mode-guarded `ui.setStatus` at the health-probe points |
@@ -468,6 +485,42 @@ state, and all timeouts. Common cases:
 
 ## Changelog
 
+### v0.3.0
+
+- **Stale `last_status` fixed (code-graph state)** — `/cognee-index --wait` now writes the
+  poll's terminal status back into the repo's index-state file (`last_status: COMPLETED /
+  ERRORED`, plus `last_status_at` stamped at observation time); v0.2 left the
+  submission-time value (`running`/`submitted`) in the file forever after the server
+  finished. A defensive `FAILED` suffix class is now terminal too (stops polling with the
+  same message shape as `ERRORED` instead of burning the wait budget). Fail-soft: abort /
+  budget-expiry keep the submission value (still accurate), and an unwritable state dir
+  never fails the command.
+- **Update-when-changed for `--file` memories (`PATCH /api/v1/update`, cognee ≥ 1.6.0)** —
+  re-ingesting a file previously stored via `cognee_remember file=` / `/cognee-remember
+  --file` no longer adds a duplicate data item. The client discovers the stored item by
+  exact filename (latest `createdAt` on same-name twins), compares content hashes
+  statelessly, no-ops on identical bytes ("unchanged — nothing sent": zero POST/PATCH — the
+  read-only discovery GETs still run), and PATCHes changed
+  content under the same `data_id` — the server re-ingests only affected chunks and
+  transparently falls back to a delete+re-ingest under the same id (the fallback reason is
+  surfaced). Discovery failures degrade to today's plain add; a **failed** update never
+  falls back to an add (the document still exists — a duplicate would corrupt identity);
+  a 404 race with `forget` re-adds. Prose memories stay append-only; `/cognee-index` is
+  untouched (whole-repo specs hold no per-file `data_id` — research/v03-update-spec.md §4).
+- **Switcher live driver** — `test/probe-switcher.mjs` drives the real `/cognee-datasets`
+  handler closure (jiti-loaded factory + stub host surface, zero production refactor —
+  research/v03-fixes-spec.md §B.2) end-to-end against a live server: seed→record
+  precedence, create-on-switch, ordinal session mint, record persistence +
+  cross-process affinity, capture/recall re-pointing, switch-back, and disposable-dataset
+  cleanup with a pre-clean pass (21 PASS / 0 FAIL / 1 characterized SKIP on cognee
+  1.6.0-local, ~45 s).
+- **Live finding — server recall is not dataset-isolated (cognee 1.6.0-local, verified
+  2026-09-24)** — `/api/v1/recall` retrieval matches across the whole user memory even
+  when the payload scopes `datasets` (name) or `dataset_ids` (UUID), including pure
+  `CHUNKS` retrieval (no LLM involved); cross-dataset content can surface in a scoped
+  query's context/completions. pi-cognee keeps sending the scoped reference payload, so
+  dataset isolation remains a server-side property until the server enforces its filters.
+
 ### v0.2.0
 
 - **Auto code-recall lane fix** — the lane was verified reference-identical on the wire
@@ -501,6 +554,10 @@ circuit breaker, pre-compact anchor, per-file code ingestion.
 
 ```bash
 node test/smoke.mjs    # registration + pure-helper checks; no network, no server
+
+# Live checks (disposable selftest datasets, deleted on exit; secrets never printed):
+COGNEE_LIVE_BASE_URL=https://cognee.example node test/live.mjs
+COGNEE_LIVE_BASE_URL=https://cognee.example node test/probe-switcher.mjs   # switcher end-to-end
 ```
 
 `tsconfig.json` is strict, `noEmit`, types-only — editors check `src/` against the real pi

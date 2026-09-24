@@ -1455,6 +1455,295 @@ await check("switcher command flow: list → validate → strict-sync abort/--fo
   }
 });
 
+/* ---------- v0.3: last_status terminal write-back (--wait poll) ---------- */
+
+await check("/cognee-index --wait: terminal status written back to the repo state (COMPLETED/ERRORED/FAILED, fail-soft)", async () => {
+  const { mkdtempSync, readFileSync, readdirSync, chmodSync } = await import("node:fs");
+  const os = await import("node:os");
+  const { join } = await import("node:path");
+  const repoDir = mkdtempSync(join(os.tmpdir(), "pi-cognee-wb-")); // plain dir — no git, no auto-index
+  const DS = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+  const stateDir = process.env.COGNEE_CODE_STATE_DIR;
+  const readState = (dataset) => {
+    for (const name of readdirSync(stateDir)) {
+      if (!name.endsWith(".json")) continue;
+      try {
+        const parsed = JSON.parse(readFileSync(join(stateDir, name), "utf8"));
+        if (parsed.dataset === dataset) return parsed;
+      } catch {
+        /* skip foreign files */
+      }
+    }
+    return undefined;
+  };
+  // Poll answers per variant: index 0 = poll #1, rest = every later poll.
+  let pollAnswers = ["DATASET_PROCESSING_STARTED", "DATASET_PROCESSING_COMPLETED"];
+  let pollIdx = 0;
+  // /cognee-index accepts local paths only in local mode — pin it regardless of
+  // the developer's shell (COGNEE_BASE_URL may point at a real cloud server).
+  const savedBackend = process.env.COGNEE_PI_BACKEND;
+  process.env.COGNEE_PI_BACKEND = "local";
+  const realFetch = globalThis.fetch;
+  const ok = (text) => ({ ok: true, status: 200, text: async () => text });
+  globalThis.fetch = async (url, opts) => {
+    const u = String(url);
+    if (u.endsWith("/api/v1/remember") && opts?.method === "POST") {
+      return ok(JSON.stringify({ dataset_id: DS, pipeline_run_id: "run-wb", status: "DATASET_PROCESSING_INITIATED" }));
+    }
+    if (u.includes("/api/v1/datasets/status")) {
+      const status = pollAnswers[Math.min(pollIdx++, pollAnswers.length - 1)];
+      return ok(JSON.stringify({ [DS]: { code_graph_pipeline: status } }));
+    }
+    return ok("[]");
+  };
+  try {
+    const { pi: piWb, recorded: recWb } = makeStubApi();
+    factory(piWb);
+    const messages = [];
+    const ctx = {
+      hasUI: true,
+      ui: { notify: (m) => messages.push(m), setStatus() {} },
+      cwd: repoDir,
+      sessionManager: { getSessionId: () => "smoke-wb" },
+    };
+    const cmd = recWb.commands.find((c) => c.name === "cognee-index");
+    assert.ok(cmd, "cognee-index command registered");
+    const lastMsg = () => messages[messages.length - 1] ?? "";
+    const t0 = Date.now();
+
+    // COMPLETED observed on poll #2 (poll #1 running → one 3s poll interval).
+    await cmd.handler(`${repoDir} --dataset smoke-wb-done --wait 5`, ctx);
+    assert.ok(lastMsg().includes("graph is queryable"), `wait outcome reported: ${lastMsg()}`);
+    let st = readState("smoke-wb-done");
+    assert.ok(st, "state file written for the submitted repo");
+    assert.equal(st.last_status, "COMPLETED", "terminal COMPLETED written back (v0.2 left the submission value forever)");
+    assert.ok(
+      typeof st.last_status_at === "number" && st.last_status_at >= t0 && st.last_status_at <= Date.now(),
+      "last_status_at stamped within test runtime",
+    );
+
+    // ERRORED on poll #1 → immediate terminal, written back.
+    pollIdx = 0;
+    pollAnswers = ["DATASET_PROCESSING_ERRORED"];
+    await cmd.handler(`${repoDir} --dataset smoke-wb-errored --wait 5`, ctx);
+    assert.ok(lastMsg().includes("pipeline ERRORED"), "ERRORED outcome reported");
+    st = readState("smoke-wb-errored");
+    assert.equal(st?.last_status, "ERRORED", "terminal ERRORED written back");
+
+    // Defensive FAILED suffix class is terminal too (stops polling, written back).
+    pollIdx = 0;
+    pollAnswers = ["GRAPH_BUILD_FAILED"];
+    await cmd.handler(`${repoDir} --dataset smoke-wb-failed --wait 5`, ctx);
+    assert.ok(lastMsg().includes("pipeline FAILED"), "FAILED outcome reported");
+    st = readState("smoke-wb-failed");
+    assert.equal(st?.last_status, "FAILED", "terminal FAILED written back");
+
+    // Fail-soft: an unwritable state dir never fails the command.
+    pollIdx = 0;
+    pollAnswers = ["DATASET_PROCESSING_COMPLETED"];
+    chmodSync(stateDir, 0o555);
+    try {
+      // Fresh repo for this variant: rewriting an EXISTING state file needs no
+      // dir-write permission (only file-write), so the fail-soft path under test
+      // is the CREATION of a new state file in the read-only dir.
+      const repoRo = mkdtempSync(join(os.tmpdir(), "pi-cognee-wb-ro-"));
+      await cmd.handler(`${repoRo} --dataset smoke-wb-ro --wait 5`, ctx);
+      assert.ok(lastMsg().includes("Submitted"), "unwritable state dir: command still succeeds");
+      assert.equal(readState("smoke-wb-ro"), undefined, "no state written when the dir is unwritable");
+    } finally {
+      chmodSync(stateDir, 0o755);
+    }
+
+    await recWb.events.get("session_shutdown")[0]({ type: "session_shutdown", reason: "quit" });
+  } finally {
+    if (savedBackend === undefined) delete process.env.COGNEE_PI_BACKEND;
+    else process.env.COGNEE_PI_BACKEND = savedBackend;
+    globalThis.fetch = realFetch;
+  }
+});
+
+/* ---------- v0.3: remember() file lane update-when-changed ---------- */
+
+await check("remember() file lane: same-hash no-op / changed-hash PATCH (exact wire) / fail-open fallbacks / no fallback on failure", async () => {
+  const realFetch = globalThis.fetch;
+  const DS = "aaaaaaaa-1111-2222-3333-444444444444";
+  const ITEM_OLD = "bbbbbbbb-1111-2222-3333-444444444444"; // 2026-01 twin
+  const ITEM_NEW = "cccccccc-1111-2222-3333-444444444444"; // 2026-02 twin (latest)
+  let dataItems = [];
+  let rawText = "";
+  let patchStatus = 200;
+  let patchBody = {};
+  let listFails = false;
+  const calls = [];
+  const ok = (text) => ({ ok: true, status: 200, text: async () => text });
+  globalThis.fetch = async (url, opts) => {
+    const u = String(url);
+    const method = opts?.method ?? "GET";
+    const body =
+      opts?.body instanceof FormData
+        ? opts.body
+        : typeof opts?.body === "string"
+          ? JSON.parse(opts.body)
+          : null;
+    calls.push({ url: u, method, body });
+    if (u.endsWith("/api/v1/datasets") && method === "GET") {
+      if (listFails) return { ok: false, status: 500, text: async () => '{"error":"boom"}' };
+      return ok(JSON.stringify([{ name: "agent_sessions", id: DS }]));
+    }
+    if (u.includes(`/api/v1/datasets/${DS}/data/`) && u.endsWith("/raw")) {
+      return ok(rawText);
+    }
+    if (u.endsWith(`/api/v1/datasets/${DS}/data`)) {
+      return ok(JSON.stringify(dataItems));
+    }
+    if (u.includes("/api/v1/update")) {
+      return { ok: patchStatus < 400, status: patchStatus, text: async () => JSON.stringify(patchBody) };
+    }
+    if (u.endsWith("/api/v1/remember") && method === "POST") {
+      return ok(JSON.stringify({ dataset_id: DS, pipeline_run_id: "run-add" }));
+    }
+    return ok("[]");
+  };
+  try {
+    const base = clientMod.loadCogneeConfig();
+    const c = new clientMod.CogneeClient({ ...base, baseUrl: "https://cognee.invalid", apiKey: "smoke-key" });
+    const posts = () => calls.filter((x) => x.url.endsWith("/api/v1/remember") && x.method === "POST");
+    const patches = () => calls.filter((x) => x.url.includes("/api/v1/update"));
+
+    // 1. identical content → authoritative no-op: nothing sent at all.
+    dataItems = [
+      { id: ITEM_OLD, name: "notes.md", created_at: "2026-01-01T00:00:00Z" },
+      { id: ITEM_NEW, name: "notes.md", created_at: "2026-02-01T00:00:00Z" },
+      { id: "dddddddd-1111-2222-3333-444444444444", name: "other.txt", created_at: "2026-03-01T00:00:00Z" },
+    ];
+    rawText = "same content";
+    calls.length = 0;
+    let r = await c.remember({ content: "same content", filename: "notes.md", dataset: "agent_sessions" });
+    assert.equal(r.ok, true, "same-hash remember ok");
+    assert.equal(r.outcome, "unchanged", "outcome: unchanged");
+    assert.equal(r.dataId, ITEM_NEW, "latest same-name twin matched (createdAt sort)");
+    assert.equal(posts().length, 0, "no POST /remember on identical content");
+    assert.equal(patches().length, 0, "no PATCH on identical content");
+    assert.ok(calls.some((x) => x.url.includes(`/data/${ITEM_NEW}/raw`)), "raw compare hit the latest twin");
+
+    // 2. changed content → PATCH with the exact wire contract; no plain add.
+    rawText = "old content";
+    patchStatus = 200;
+    patchBody = {
+      status: "incremental",
+      regions: 2,
+      deleted_chunks: 1,
+      added_chunks: 3,
+      reused_chunks: 0,
+      kept_chunks: 12,
+      reindexed_chunks: 0,
+      total_chunks: 15,
+      data_id: ITEM_NEW,
+      dataset_id: DS,
+      duration_seconds: 1.2,
+      pipeline_run_id: "run-upd",
+      fallback: null,
+    };
+    calls.length = 0;
+    r = await c.remember({ content: "same content", filename: "notes.md", dataset: "agent_sessions" });
+    assert.equal(r.ok, true, "changed-hash remember ok");
+    assert.equal(r.outcome, "updated", "outcome: updated");
+    assert.equal(r.update.status, "incremental", "server status surfaced");
+    assert.equal(r.update.detail, "+3/−1 chunks, 12 kept", "compact counter line");
+    assert.equal(r.pipelineRunId, "run-upd", "pollable run id surfaced");
+    assert.equal(r.datasetId, DS, "dataset id for the cognify wait suffix");
+    assert.equal(posts().length, 0, "changed file PATCHes — never a duplicate plain add");
+    const patch = patches()[0];
+    assert.ok(patch, "PATCH fired");
+    assert.equal(patch.method, "PATCH", "single PATCH method (no GET/POST sibling)");
+    assert.equal(
+      patch.url,
+      `https://cognee.invalid/api/v1/update?data_id=${ITEM_NEW}&dataset_id=${DS}`,
+      "identity rides the query string (canonical UUIDs)",
+    );
+    const part = patch.body.get("data");
+    assert.equal(part && part.name, "notes.md", "multipart data part keeps the real basename (loader routing)");
+    assert.equal(await part.text(), "same content", "PATCH carries the new content");
+    assert.equal(patch.body.get("node_set"), null, "node_set omitted on update (already bound at first ingest)");
+    assert.equal(patch.body.get("chunk_level_diff"), null, "chunk_level_diff omitted (server default true)");
+
+    // 3. full_rebuild surfaces its fallback reason.
+    patchBody = {
+      status: "full_rebuild",
+      data_id: ITEM_NEW,
+      dataset_id: DS,
+      duration_seconds: 2,
+      pipeline_run_id: "run-reb",
+      fallback: { reason: "no_baseline", detail: "no stored chunk map" },
+    };
+    r = await c.remember({ content: "same content", filename: "notes.md", dataset: "agent_sessions" });
+    assert.equal(r.update.detail, "memory dropped and rebuilt (fallback: no_baseline)", "rebuild + fallback line");
+
+    // 4. server-side "failed" (or HTTP 500) → error, and NO plain-add fallback
+    //    (the document still exists; a duplicate would corrupt identity).
+    patchStatus = 500;
+    patchBody = {
+      status: "failed",
+      error: { error_class: "PipelineError", message: "cognify boom" },
+      data_id: ITEM_NEW,
+      dataset_id: DS,
+      duration_seconds: 3,
+    };
+    calls.length = 0;
+    r = await c.remember({ content: "same content", filename: "notes.md", dataset: "agent_sessions" });
+    assert.equal(r.ok, false, "failed update surfaces as an error");
+    assert.ok(/cognify boom/.test(r.error?.message ?? ""), "server error message carried");
+    assert.ok(/retry/.test(r.error?.message ?? ""), "retryable hint present");
+    assert.equal(posts().length, 0, "no plain-add fallback after a failed update");
+
+    // 5. 404 race (forget raced discovery) → fall back to a plain add.
+    patchStatus = 404;
+    patchBody = { error: "not found" };
+    calls.length = 0;
+    r = await c.remember({ content: "same content", filename: "notes.md", dataset: "agent_sessions" });
+    assert.equal(r.ok, true, "404 fallback lands");
+    assert.equal(r.outcome, "stored", "404 → plain add re-creates the document");
+    assert.equal(posts().length, 1, "plain POST fired exactly once");
+
+    // 6. filename never ingested → plain add directly (no raw fetch, no PATCH).
+    patchStatus = 200;
+    dataItems = [{ id: "dddddddd-1111-2222-3333-444444444444", name: "other.txt", created_at: "2026-03-01T00:00:00Z" }];
+    calls.length = 0;
+    r = await c.remember({ content: "x", filename: "brand-new.md", dataset: "agent_sessions" });
+    assert.equal(r.outcome, "stored", "unmatched name → plain add");
+    assert.equal(patches().length, 0, "no PATCH for a never-ingested filename");
+    assert.equal(posts().length, 1, "plain POST fired");
+
+    // 7. discovery failure (dataset list 500) → fail open to a plain add.
+    listFails = true;
+    calls.length = 0;
+    r = await c.remember({ content: "x", filename: "brand-new.md", dataset: "agent_sessions" });
+    assert.equal(r.ok, true);
+    assert.equal(r.outcome, "stored", "discovery failure degrades to today's behavior");
+    assert.equal(posts().length, 1);
+    listFails = false;
+
+    // 8. prose lane untouched: no filename → plain POST with the synthetic name.
+    calls.length = 0;
+    r = await c.remember({ content: "just prose", dataset: "agent_sessions" });
+    assert.equal(r.outcome, "stored", "prose stays append-only");
+    assert.equal(patches().length, 0, "prose memories never PATCH");
+    assert.ok(
+      String(posts()[0]?.body.get("data")?.name ?? "").startsWith("pi-memory-"),
+      "synthetic timestamped name for prose",
+    );
+
+    // 9. non-UUID ids never leave the client (the 422 guard).
+    calls.length = 0;
+    const bad = await c.updateDataItem({ datasetId: "not-a-uuid", dataId: ITEM_NEW, content: "x", filename: "a.md" });
+    assert.equal(bad.ok, false, "non-UUID rejected client-side");
+    assert.ok(/UUID/.test(bad.error?.message ?? ""), "guard explains itself");
+    assert.equal(calls.length, 0, "no request sent for non-UUID identity");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 await check("factory leaves no pending timers (no long-lived resources)", async () => {
   // Final re-check after all fixtures: no timer/handle leaked from the checks above.
   await new Promise((resolve) => setTimeout(resolve, 10));
