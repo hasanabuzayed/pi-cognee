@@ -633,6 +633,9 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
     if (!cfg.capture || state.stopped || !state.healthy || breakerOpen()) return;
     const repo = findIndexedRepo(cwd);
     if (!repo || repo.spec_kind !== "path" || !repo.repo_root || !repo.dataset) return;
+    // Remote servers can't read local paths — an auto re-submit would always fail
+    // server-side in the background (and leave a zombie "running" repo-state entry).
+    if (cfg.backend !== "local") return;
     const now = Date.now();
     if (retrySuppressed(repo, now)) return;
     const fingerprint = await gitFingerprint(repo.repo_root);
@@ -1209,7 +1212,7 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           if (params.targets?.length) codeQuery.targets = params.targets;
           if (params.limit) codeQuery.limit = params.limit;
           if (params.max_depth) codeQuery.max_depth = params.max_depth;
-          if (!seed) seed = params.name ?? params.start ?? params.source ?? params.targets?.[0] ?? op;
+          if (!seed) seed = params.name ?? params.start ?? params.source ?? params.targets?.[0] ?? (op === "delta" ? "" : op); // delta's server-side query is a repo-name filter — an op-name seed would filter everything out
         } else if (!seed) {
           return textResult(
             "⚠ Provide a seed (node name) or an operation (query_facts, explore, traverse, find_path, impact_analysis, delta). " +
@@ -1237,7 +1240,9 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           body ||
             (result.noGraph
               ? `Code dataset '${resolved.dataset}' has no graph yet — indexing may still be running (check /cognee-index --wait).`
-              : `No code facts for '${seed}' — the graph has no such symbol (an empty result, not an error).`),
+              : codeQuery?.operation === "delta"
+                ? `Delta: no repository records in dataset '${resolved.dataset}'s graph — nothing indexed or stamped yet.`
+                : `No code facts for '${seed}' — the graph has no such symbol (an empty result, not an error).`),
           { hits: hits.length, dataset: resolved.dataset, resolvedVia: resolved.how },
         );
       } catch (err) {
@@ -1539,9 +1544,10 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
         if (isLocalSpec && cfg.backend !== "local") {
           report(
             ctx,
-            `⚠ Cloud/remote servers cannot read local paths — '${spec}' will likely be rejected. Pass a git URL instead (the server clones it; freshness then follows pushed commits).`,
-            "warning",
+            `✕ Cloud/remote servers cannot read local paths — '${spec}' was NOT submitted. Pass a git URL instead (the server clones it; freshness then follows pushed commits).`,
+            "error",
           );
+          return;
         }
         const { dataset: usedDataset, result } = await indexRepoAndRecord(resolvedSpec, { dataset, indexVectors });
         if (!result.ok) {
@@ -1630,6 +1636,8 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
             return;
           }
         }
+        if (!codeQuery && /^delta$/i.test(trimmed)) codeQuery = { operation: "delta" }; // bare "delta" is documented as an operation
+        if (codeQuery?.operation === "delta" && !codeQuery.name && !codeQuery.repo) seed = ""; // the server uses the query as a repo-name filter — don't poison it
         const resolved = await resolveCodeDataset(dataset, undefined);
         if ("error" in resolved) {
           report(ctx, resolved.error, "warning");
@@ -1648,7 +1656,9 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           body ||
             (result.noGraph
               ? `Code dataset '${resolved.dataset}' has no graph yet — indexing may still be running.`
-              : `No code facts for '${seed}' — the graph has no such symbol.`),
+              : codeQuery?.operation === "delta"
+                ? `Delta: no repository records in dataset '${resolved.dataset}'s graph — nothing indexed or stamped yet.`
+                : `No code facts for '${seed}' — the graph has no such symbol.`),
           body ? "info" : "warning",
         );
       } catch (err) {
