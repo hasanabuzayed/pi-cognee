@@ -24,7 +24,8 @@ cognee server is missing, slow, or erroring:
 - every network call is bounded by a short timeout (recall 4s, health 2.5s, requests 10s),
 - every hook, tool, and command body is fail-soft — server down means a one-time quiet
   "offline" notice and tools returning a helpful error string, never a crash or a hang,
-- a circuit breaker pauses auto-recall after repeated failures and a background probe
+- a circuit breaker pauses auto-recall after repeated failures (file-shared across pi
+  processes via `~/.cognee-plugin/pi/breaker.json`) and a background probe
   reconnects automatically when the server comes back,
 - auto-captured turns are buffered in memory while the server is down and replayed on
   reconnect (buffered turns are lost if pi exits before the server returns — there is
@@ -62,6 +63,13 @@ cap, matching the official plugins since 1.6.0). When recall is skipped or fails
 instead sees a one-line outage header so consulted-and-failed memory is never silent:
 `=== Cognee memory: recall skipped (server unreachable|auth failed|server error|server not
 responding|circuit breaker open) · N awaiting replay ===`.
+
+When the context window is about to be compacted (`session_before_compact`), the extension
+stores a **memory anchor** into the session-cache tier first: one session-scoped graph recall
+(`top_k=3`, seeded by a keyword query built from the transcript being compacted) verbatim
+(capped at 8000 chars — it is stored as a session-cache QA answer), falling back to the recent
+turns themselves when the graph has nothing — so post-compact
+auto-recall keeps continuity. Detached and fail-soft: compaction itself is never blocked.
 
 ## Install
 
@@ -164,7 +172,7 @@ effectively ignored on the forced-local path — only `COGNEE_LOCAL_API_URL` is 
 |---|---|
 | `/cognee` | Status: health + latency, mode, dataset, session, API key source, capture/auto settings, recall hits, queue, breaker, code-graph state |
 | `/cognee-doctor` | Diagnose: mode + why, env file and shell overrides, API key source, reachability + latency + version, dataset list, breaker, timeouts, code graph |
-| `/cognee-remember <text>` | Store text in the graph. `--file <path>` to ingest a file (≤200 KB), `--node-set user_context\|project_docs\|agent_actions` to pick the memory category. Waits briefly for cognify |
+| `/cognee-remember <text>` | Store text in the graph. `--file <path>` ingests one file (≤200 KB, text-only) **verbatim under its real filename** — code extensions route down the zero-LLM code-graph path (single file, no cross-file edges; use `/cognee-index` for those). `--node-set user_context\|project_docs\|agent_actions` picks the memory category. Waits briefly for cognify |
 | `/cognee-search <query>` | Explicit graph search. `--top-k N`, `--dataset <name>` |
 | `/cognee-index [path\|git-url]` | Index a repo into the code graph (cognee ≥ 1.5.4). `--dataset <name>`, `--index-vectors` (embed code facts for semantic search), `--wait <seconds>` (poll until queryable). Default dataset `codebase-<repo>-<digest>`, printed on success. Local paths need a server sharing this filesystem (cloud servers reject them — pass a git URL; the command warns) |
 | `/cognee-code <seed> \| '<operation-json>'` | Query the current repo's code graph: a plain word is a seed (exact/suffix/substring); or an exact operation — `{"operation":"impact_analysis","targets":["process_payment"]}`, `query_facts` (e.g. `kind:"route"` lists endpoints), `explore`, `traverse`, `find_path`, `delta` (what the last index changed). `--dataset <name>`, `--top-k N` |
@@ -237,7 +245,7 @@ graph recall inside the same recall budget, so it can never add latency beyond i
 
 | Tool | Use when… |
 |---|---|
-| `cognee_remember(content, node_set?, dataset?)` | The user states a lasting preference, decision, convention, or fact — or asks you to remember something |
+| `cognee_remember(content \| file, node_set?, dataset?)` | The user states a lasting preference, decision, convention, or fact — or asks you to remember something. `file` uploads one file from disk under its real filename (code extensions → zero-LLM code-graph route) |
 | `cognee_recall(query, search_type?, session_only?, top_k?)` | Targeted memory lookup mid-task; `session_only=true` reads this session's raw Q&A cache |
 | `cognee_search(query, top_k?, dataset?, search_type?)` | Broad/exploratory graph search, cross-dataset (incl. memories written by the Claude Code / Codex plugins) |
 | `cognee_code(seed?, operation?, name?/start?/source?+target?/targets?/kind?/limit?/max_depth?/direction?, repo?, dataset?, top_k?)` | Structural code questions naming a symbol/file: callers of a seed, `impact_analysis` (what breaks if X changes), `find_path` (how A reaches B), `query_facts kind:"route"` (all endpoints), `explore`/`traverse`, `delta` (what the last index changed) — exact, instant, no tokens. Conceptual questions → `cognee_search` |
@@ -259,10 +267,13 @@ Auto-capture (prompts + answers into the session cache) follows the official plu
 - huge payloads are skipped (prompts capped at 4000 bytes, answers at 8000; oversized prompts
   dropped rather than clipped), prompts under 5 chars and slash commands are ignored.
 
-Explicit memory (`cognee_remember`, `/cognee-remember`, including `--file` ingestion) goes
-through the same redaction — a deliberate hardening beyond the official plugins, which leave
-explicit remember unfiltered: once stored, a secret is durable, cross-session, and shared with
-other agents.
+Explicit remember of **inline text** (`cognee_remember`, `/cognee-remember`) goes through the
+same redaction — a deliberate hardening beyond the official plugins, which leave explicit
+remember unfiltered: once stored, a secret is durable, cross-session, and shared with
+other agents. `--file` / `file=` uploads are stored **verbatim under the real filename**
+(like the official plugins' `--file` path): the filename extension is the server's
+loader-routing signal, and redacting code would corrupt what the zero-LLM code path
+ingests — point the tool at code, not at secrets.
 
 ## Environment variables
 
@@ -288,8 +299,10 @@ passes through `LLM_API_KEY` / `LLM_MODEL` for a local server (reported by `/cog
 | `COGNEE_HEALTH_TIMEOUT_MS` | `2500` | Health probe timeout |
 | `COGNEE_IMPROVE_SUBMIT_TIMEOUT_MS` | `60000` | Improve submit timeout |
 | `COGNEE_REMEMBER_WAIT_SECONDS` | `8` | Bounded wait for graph queryability after `/cognee-remember` |
+| `COGNEE_REMEMBER_BACKGROUND` | `true` | `run_in_background` default for explicit remember writes — set `false` for a synchronous, immediately-queryable write |
 | `COGNEE_BUFFER_LIMIT` | `100` | In-memory write buffer size while server is down |
 | `COGNEE_BREAKER_THRESHOLD/WINDOW_MS/COOLDOWN_MS` | `5` / `300000` / `120000` | Circuit breaker (only unreachable/5xx count) |
+| `COGNEE_BREAKER_FILE` | `~/.cognee-plugin/pi/breaker.json` | Cross-process breaker state file (open-until + consecutive-failure count, keyed by server URL) |
 | `COGNEE_CODE_AUTOINDEX` | `auto` | Code-graph auto-indexing of new repos: `auto` (loopback server only), `always` (any server), `off`. `COGNEE_CAPTURE=false` disables it as part of all automation |
 | `COGNEE_CODE_INDEX_TIMEOUT_MS` | `120000` | Repo-index submit timeout (background pipelines confirm slowly; a timeout is not retried blindly — the submission may have landed) |
 
@@ -308,13 +321,15 @@ passes through `LLM_API_KEY` / `LLM_MODEL` for a local server (reported by `/cog
 | Forget (doc / whole dataset, irreversible, confirmed, data-item discovery) | ✅ | ✅ |
 | Manual sync skill/command | ✅ | ✅ `/cognee-sync` + `cognee_sync` |
 | Doctor (mode, env, reachability, latency, datasets) | ✅ | ✅ `/cognee-doctor` |
-| Circuit breaker on recall | ✅ file-shared | ✅ in-memory, per-process |
+| Circuit breaker on recall | ✅ file-shared | ✅ file-shared (`~/.cognee-plugin/pi/breaker.json`, in-memory fast path, stale-read tolerant) |
 | Code graph: repo indexing (`content_type="code"`, `codebase-<repo>-<digest>` datasets, `--index-vectors`, `--wait` poll) | ✅ | ✅ same wire format |
 | Code graph: deterministic queries (query_facts, explore, traverse, find_path, impact_analysis, delta) | ✅ | ✅ via `cognee_code` / `/cognee-code` (POST `/api/v1/recall` scope `code` + `code_query`) |
 | Code graph: session-start auto-index + 3000-file cap + freshness fingerprint/re-index | ✅ detached hooks | ✅ in-process, debounced, fail-soft |
 | Code graph: identifier-shaped code recall lane (`=== Code graph facts ===`) | ✅ | ✅ concurrent lane, 1000-char cap, same recall budget |
+| Per-file code ingestion (`--file`, real filename → zero-LLM code route, no cross-file edges) | ✅ `cognee-remember --file` | ✅ `cognee_remember file=` param + `/cognee-remember --file` (verbatim, guarded: exists/size/text-only/credential-path refusal) |
+| Pre-compact memory anchor (session-scoped graph recall + recent turns preserved) | ✅ PreCompact hook | ✅ `session_before_compact` → anchor stored into the session-cache tier |
 | Server bootstrap (uv venv, uvicorn, pinned version) | ✅ | ❌ deferred — run the server yourself |
-| Status text (`●/✕ cognee: mode · dataset` in pi's footer) | ✅ | ✅ |
+| Status text (`●/✕ cognee: mode · dataset` in pi's footer, health glyph + backend + dataset in every state) | ✅ | ✅ mode-guarded `ui.setStatus` at the health-probe points |
 | Rich statusline renderer (hit counts, credits, update glyph) | ✅ | ❌ deferred |
 | cognee-recall subagent | ✅ | ❌ deferred |
 | Dataset switcher | ✅ | ❌ deferred (per-call `dataset` overrides cover the basics) |
@@ -336,28 +351,22 @@ cache) with the official plugins, so all three agents can share one memory. The 
 2. **Tool-call trace capture** (`PostToolUse` → trace entries, `COGNEE_CAPTURE_TOOLS` allowlist,
    sensitive-path deny list, `COGNEE_CAPTURE_REDACT_PATTERNS` extension) — capture is QA-pairs
    only; text-level redaction of prompts/answers **is** implemented.
-3. **Pre-compact memory anchor** — pi exposes compaction events, so this remains implementable
-   later; the official anchor (session detail → graph recall top_k=3 → inject) is not wired.
-4. **Dataset switcher** (register-then-unregister session re-pointing); per-call `dataset`
+3. **Dataset switcher** (register-then-unregister session re-pointing); per-call `dataset`
    overrides on remember/search/forget partially cover it.
-5. **Shared-agent-memory provisioning** (plugin identity `/provision`, tenant/role grants,
+4. **Shared-agent-memory provisioning** (plugin identity `/provision`, tenant/role grants,
    `COGNEE_PLUGIN_IDENTITY` × `COGNEE_SHARED_AGENT_MEMORY`) — single principal key only.
-6. **Rich statusline renderer** (glyph states beyond the four implemented, hit counts, credits
+5. **Rich statusline renderer** (glyph states beyond the implemented ones, hit counts, credits
    segment, update marker, per-terminal propagation).
-7. **Idle watcher / exit watcher / detached retrying final-sync worker** — replaced by bounded
+6. **Idle watcher / exit watcher / detached retrying final-sync worker** — replaced by bounded
    in-process equivalents (auto-every-N improve, ≤9s final sync, 60s re-probe); the persisted
    improve-cooldown (`improve-state/`) is also deferred (cooldown is in-memory).
-8. **Disk-backed write bridge** (`bridge/` spill + verify-before-replay) — in-memory buffer of
+7. **Disk-backed write bridge** (`bridge/` spill + verify-before-replay) — in-memory buffer of
    `COGNEE_BUFFER_LIMIT` (100) entries with drop-oldest; buffered turns are lost if pi exits
    before the server returns.
-9. **File-shared circuit breaker** (`~/.cognee-plugin/recall-breaker.json`) — in-memory,
-   per-process; the failure classification (only unreachable/5xx count) matches.
-10. **Misc**: credits/billing refresh, `cognee-cli` offline fallback, cognee-recall subagent,
-    session-companion datasets / `COGNEE_PROJECT_NODE_SET`, per-file code ingestion via
-    `cognee-remember --file` (the repo-level graph covers the cross-file case),
-    `~/.cognee/.env` template creation, usage metrics rollup (`cognee-plugin metrics`),
-    other-readable-datasets hint on empty recall (`COGNEE_RECALL_DATASET_HINT`), `/clear`
-    transcript handling, update check, log rotation.
+8. **Misc**: credits/billing refresh, `cognee-cli` offline fallback, cognee-recall subagent,
+    session-companion datasets / `COGNEE_PROJECT_NODE_SET`, `~/.cognee/.env` template creation,
+    usage metrics rollup (`cognee-plugin metrics`), other-readable-datasets hint on empty recall
+    (`COGNEE_RECALL_DATASET_HINT`), `/clear` transcript handling, update check, log rotation.
 
 Deliberate behavioral differences (implemented differently on purpose):
 
@@ -367,8 +376,10 @@ Deliberate behavioral differences (implemented differently on purpose):
   remember unfiltered (prevention beats cleanup via forget).
 - **Owner-key mint is lazy** (first authenticated call / first successful health probe, at most
   once per process) rather than a synchronous session-start bootstrap.
-- **Buffering, breaker and final sync are in-process and bounded** (see items 7–9) — the
-  official plugins use detached workers and cross-process files.
+- **Buffering and final sync are in-process and bounded** — the official plugins use detached
+  workers and cross-process files; the recall breaker, by contrast, **is** file-shared
+  (`~/.cognee-plugin/pi/breaker.json`) with an in-memory fast path, so concurrent pi
+  processes share outage state.
 - **Code-graph state is pi-scoped** (`~/.cognee-plugin/pi/code-graph/`, mirroring the official
   plugins' per-integration dirs) while dataset names are the same pure function of the repo
   path — so a repo indexed from pi, Claude Code, or Codex resolves to the same graph, and each

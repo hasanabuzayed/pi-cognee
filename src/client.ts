@@ -8,9 +8,17 @@
  */
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -188,6 +196,8 @@ export interface CogneeConfig {
   improveCooldownMs: number;
   autoImproveEvery: number;
   rememberWaitMs: number;
+  /** Default run_in_background for explicit remember writes (COGNEE_REMEMBER_BACKGROUND). */
+  rememberBackground: boolean;
   finalSync: boolean;
   bufferLimit: number;
   breakerThreshold: number;
@@ -306,6 +316,7 @@ export function loadCogneeConfig(): CogneeConfig {
     improveCooldownMs: num(effective, "COGNEE_IMPROVE_COOLDOWN_MS", 1800000),
     autoImproveEvery: num(effective, "COGNEE_AUTO_IMPROVE_EVERY", 150),
     rememberWaitMs: num(effective, "COGNEE_REMEMBER_WAIT_SECONDS", 8) * 1000,
+    rememberBackground: bool(effective, "COGNEE_REMEMBER_BACKGROUND", true),
     finalSync: bool(effective, "COGNEE_FINAL_SYNC", true),
     bufferLimit: num(effective, "COGNEE_BUFFER_LIMIT", 100),
     breakerThreshold: num(effective, "COGNEE_BREAKER_THRESHOLD", 5),
@@ -630,6 +641,154 @@ export function findIndexedRepo(cwd: string): CodeRepoState | undefined {
   return best;
 }
 
+/*
+ * ------------------------------------------------------------------
+ * Per-file ingestion (cognee-remember --file) — guarded disk read
+ * ------------------------------------------------------------------ */
+
+/** Hard cap for a --file upload (same as the official plugins' practical limit). */
+export const REMEMBER_FILE_MAX_BYTES = 200_000;
+
+/** Obvious secret-carrier paths, refused before any disk read. The reference
+ *  --file route uploads any user-given path verbatim (parity), but pi-cognee
+ *  refuses credential-looking files (~/.ssh, *.pem, .env, id_rsa*, credentials*)
+ *  with a helpful error — hardening beyond parity. */
+const SENSITIVE_REMEMBER_PATH_RE =
+  /(?:^|[\\/])\.ssh(?:[\\/]|$)|(?:^|[\\/])\.env(?:[\\/.]|$)|(?:^|[\\/])id_(?:rsa|dsa|ecdsa|ed25519)|(?:^|[\\/])credentials[^\\/]*$|\.pem$/i;
+
+export interface RememberFileResult {
+  ok: boolean;
+  /** File text (utf-8) — verbatim, NOT redacted (code must route as code). */
+  text?: string;
+  /** Real basename — the server's loader-routing signal (payments.py → code route). */
+  basename?: string;
+  bytes?: number;
+  error?: string;
+}
+
+/**
+ * Read one file for /api/v1/remember file ingestion. Mirrors cognee-remember.sh
+ * --file + _remember_http.do_remember: the file must exist, is capped in size,
+ * and must be text (NUL bytes / control-char-heavy content is rejected — the
+ * prose and code pipelines are text-only). Never throws; failures come back as
+ * { ok: false, error } so callers can surface a helpful message.
+ */
+export function readRememberFile(
+  filePath: string,
+  maxBytes: number = REMEMBER_FILE_MAX_BYTES,
+): RememberFileResult {
+  try {
+    const trimmed = String(filePath).replace(/\/+$/, "");
+    if (SENSITIVE_REMEMBER_PATH_RE.test(trimmed)) {
+      return {
+        ok: false,
+        error: `refusing likely-secret file '${filePath}' — remember the non-secret part as content instead`,
+      };
+    }
+    const st = statSync(trimmed);
+    if (!st.isFile()) return { ok: false, error: `not a file: ${filePath}` };
+    if (st.size > maxBytes) {
+      return {
+        ok: false,
+        error: `file too large (${st.size} bytes; limit ${maxBytes}) — remember a summary instead`,
+      };
+    }
+    const buf = readFileSync(trimmed);
+    // Text-only guard: a NUL byte or a control-char-heavy head means binary —
+    // uploading it would corrupt the graph and route nowhere useful.
+    const probe = buf.subarray(0, 8192);
+    let control = 0;
+    for (const byte of probe) {
+      if (byte === 0) return { ok: false, error: `binary file rejected (NUL byte): ${filePath}` };
+      if (byte < 32 && byte !== 9 && byte !== 10 && byte !== 13) control++;
+    }
+    if (probe.length > 0 && control / probe.length > 0.1) {
+      return { ok: false, error: `binary file rejected (too many control characters): ${filePath}` };
+    }
+    return {
+      ok: true,
+      text: buf.toString("utf8"),
+      basename: basename(trimmed) || "upload.txt",
+      bytes: st.size,
+    };
+  } catch (err) {
+    const message = describeError(err);
+    return {
+      ok: false,
+      error: /ENOENT/.test(message)
+        ? `file not found: ${filePath}`
+        : `cannot read ${filePath}: ${message}`,
+    };
+  }
+}
+
+/*
+ * ------------------------------------------------------------------
+ * File-shared circuit breaker (~/.cognee-plugin/pi/breaker.json)
+ * ------------------------------------------------------------------ */
+
+export interface SharedBreakerEntry {
+  /** Epoch ms — recall is paused until then (0/absent = closed). */
+  open_until?: number;
+  /** Consecutive outage-classified failures seen across processes. */
+  consecutive_failures?: number;
+  updated_at?: string;
+}
+
+/** { "<base_url>": { open_until, consecutive_failures, updated_at } } */
+export type SharedBreakerFile = Record<string, SharedBreakerEntry>;
+
+export const DEFAULT_BREAKER_FILE = join(homedir(), ".cognee-plugin", "pi", "breaker.json");
+
+/**
+ * Read the shared breaker entry for one server. Stale-read tolerant: a missing,
+ * corrupt, or non-object file is an empty entry (never throws), so a half-written
+ * or foreign file degrades to per-process behavior instead of breaking recall.
+ */
+export function loadSharedBreaker(
+  baseUrl: string,
+  filePath: string = DEFAULT_BREAKER_FILE,
+): SharedBreakerEntry {
+  try {
+    const raw = JSON.parse(readFileSync(filePath, "utf8"));
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+    const entry = (raw as SharedBreakerFile)[baseUrl];
+    if (!entry || typeof entry !== "object") return {};
+    return entry;
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Persist the shared breaker entry for one server. Best-effort atomic write
+ * (temp file + rename, same pattern as the official plugins' state markers):
+ * other entries in the file are preserved, and any failure is swallowed — the
+ * in-memory breaker keeps working when the disk does not.
+ */
+export function saveSharedBreaker(
+  baseUrl: string,
+  entry: SharedBreakerEntry,
+  filePath: string = DEFAULT_BREAKER_FILE,
+): void {
+  try {
+    let all: SharedBreakerFile = {};
+    try {
+      const raw = JSON.parse(readFileSync(filePath, "utf8"));
+      if (raw && typeof raw === "object" && !Array.isArray(raw)) all = raw as SharedBreakerFile;
+    } catch {
+      /* unreadable/absent — start from an empty map */
+    }
+    all[baseUrl] = { ...entry, updated_at: new Date().toISOString() };
+    mkdirSync(dirname(filePath), { recursive: true });
+    const tmp = `${filePath}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(all), "utf8");
+    renameSync(tmp, filePath);
+  } catch {
+    /* fail-soft — shared-state propagation is an optimization */
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* Capture policy: redaction + truncation (per the claude-code brief §4) */
 /* ------------------------------------------------------------------ */
@@ -718,6 +877,7 @@ export interface RememberParams {
   nodeSet?: "user_context" | "project_docs" | "agent_actions";
   dataset?: string;
   datasetId?: string;
+  /** Defaults to cfg.rememberBackground (COGNEE_REMEMBER_BACKGROUND, default true). */
   background?: boolean;
   timeoutMs?: number;
   externalSignal?: AbortSignal;
@@ -1070,6 +1230,8 @@ export class CogneeClient {
   /**
    * POST /api/v1/remember — multipart. The file part keeps a real .txt basename so the
    * server routes it through the prose LLM pipeline (code extensions go the zero-LLM route).
+   * run_in_background defaults to cfg.rememberBackground (COGNEE_REMEMBER_BACKGROUND —
+   * set false for a synchronous, immediately-queryable write, like the reference).
    */
   async remember(params: RememberParams): Promise<{
     ok: boolean;
@@ -1082,7 +1244,7 @@ export class CogneeClient {
       await this.ensureAuth(); // no-op once a key is resolved (or off-loopback)
       const form = new FormData();
       form.set("node_set", params.nodeSet ?? "user_context");
-      form.set("run_in_background", String(params.background ?? true));
+      form.set("run_in_background", String(params.background ?? this.cfg.rememberBackground));
       if (params.datasetId) form.set("datasetId", params.datasetId);
       else if (params.dataset) form.set("datasetName", sanitizeDatasetName(params.dataset));
       const filename =

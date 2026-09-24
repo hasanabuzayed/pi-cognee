@@ -18,6 +18,8 @@ import { resolve as pathResolve } from "node:path";
 import {
   CogneeClient,
   CogneeError,
+  DEFAULT_BREAKER_FILE,
+  REMEMBER_FILE_MAX_BYTES,
   buildCodeQuery,
   canonicalRepoSpec,
   codeDatasetName,
@@ -31,10 +33,13 @@ import {
   isRemoteRepoSpec,
   isUuid,
   loadCogneeConfig,
+  loadSharedBreaker,
+  readRememberFile,
   redactSecrets,
   sanitizeDatasetName,
   sanitizeSessionId,
   saveRepoState,
+  saveSharedBreaker,
   truncateText,
   wrapAsCogneeError,
   type CogneeConfig,
@@ -77,6 +82,12 @@ type CodeOp = (typeof CODE_OPS)[number];
 
 const REPROBE_INTERVAL_MS = 60_000;
 const FINAL_SYNC_TIMEOUT_MS = 4000;
+/** Min spacing between cross-process breaker-file reads on the hot path. */
+const BREAKER_FILE_SYNC_MS = 5000;
+/** Per-item cap for the pre-compact anchor's fallback section (same as pre-compact.py). */
+const ANCHOR_TURN_CHARS = 300;
+/** Whole-anchor cap — the anchor is a session-cache QA answer, keep it bounded. */
+const ANCHOR_MAX_CHARS = 8000;
 
 function extractText(content: unknown): string {
   if (typeof content === "string") return content;
@@ -204,6 +215,7 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
     lastCheckAt: 0,
     failureTimestamps: [] as number[],
     breakerOpenUntil: 0,
+    breakerFileSyncedAt: 0,
     degradedNotified: false,
     datasetEnsured: false,
     sessionId: "",
@@ -268,12 +280,29 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
   }
 
   /* ----- Circuit breaker (recall path) ----- */
-  // ponytail: in-memory breaker instead of the official file-shared one — good enough
-  // for one pi process; cross-terminal state propagation is consciously deferred.
+  // File-shared like the official plugins: the in-memory window stays the fast
+  // path, but open-until/failure-count also live in ~/.cognee-plugin/pi/breaker.json
+  // so concurrent pi processes share outage state instead of each hammering a
+  // down server. All file IO is guarded, atomic (tmp+rename), and never throws.
+
+  function sharedBreakerPath(): string {
+    return process.env.COGNEE_BREAKER_FILE || DEFAULT_BREAKER_FILE;
+  }
 
   function recordSuccess(): void {
     state.failureTimestamps = [];
+    const wasOpen = state.breakerOpenUntil > 0;
     state.breakerOpenUntil = 0;
+    // A definitive success is evidence the server is back for everyone sharing
+    // it — clear the shared state only when it actually holds something.
+    try {
+      const shared = loadSharedBreaker(cfg.baseUrl, sharedBreakerPath());
+      if (wasOpen || (Number(shared.open_until) || 0) > 0 || (Number(shared.consecutive_failures) || 0) > 0) {
+        saveSharedBreaker(cfg.baseUrl, { open_until: 0, consecutive_failures: 0 }, sharedBreakerPath());
+      }
+    } catch {
+      /* fail-soft */
+    }
   }
 
   function recordFailure(err?: CogneeError): void {
@@ -283,14 +312,70 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
     const now = Date.now();
     state.failureTimestamps.push(now);
     state.failureTimestamps = state.failureTimestamps.filter((t) => now - t <= cfg.breakerWindowMs);
-    if (state.failureTimestamps.length >= cfg.breakerThreshold) {
-      state.breakerOpenUntil = now + cfg.breakerCooldownMs;
-      state.failureTimestamps = [];
+    try {
+      const shared = loadSharedBreaker(cfg.baseUrl, sharedBreakerPath());
+      const sharedOpen = Number(shared.open_until) || 0;
+      const sharedCount = Number(shared.consecutive_failures) || 0;
+      if (state.failureTimestamps.length >= cfg.breakerThreshold) {
+        state.breakerOpenUntil = now + cfg.breakerCooldownMs;
+        state.failureTimestamps = [];
+        saveSharedBreaker(
+          cfg.baseUrl,
+          {
+            open_until: Math.max(state.breakerOpenUntil, sharedOpen),
+            consecutive_failures: 0,
+          },
+          sharedBreakerPath(),
+        );
+      } else {
+        // Carry the cross-process count: another terminal's failures count
+        // toward the same outage (max, not sum — windows are per-process).
+        saveSharedBreaker(
+          cfg.baseUrl,
+          {
+            open_until: sharedOpen,
+            consecutive_failures: Math.max(state.failureTimestamps.length, sharedCount),
+          },
+          sharedBreakerPath(),
+        );
+      }
+    } catch {
+      /* fail-soft — in-memory breaker still applied */
     }
   }
 
   function breakerOpen(): boolean {
-    return Date.now() < state.breakerOpenUntil;
+    if (Date.now() < state.breakerOpenUntil) return true;
+    // Cross-process check, rate-limited so the per-prompt hot path stays in-memory.
+    const now = Date.now();
+    if (now - state.breakerFileSyncedAt < BREAKER_FILE_SYNC_MS) return false;
+    state.breakerFileSyncedAt = now;
+    try {
+      const openUntil = Number(loadSharedBreaker(cfg.baseUrl, sharedBreakerPath()).open_until) || 0;
+      if (openUntil > now) {
+        // Adopt the shared outage window, capped at one cooldown — a stale or
+        // clock-skewed future timestamp must not pin recall open forever.
+        state.breakerOpenUntil = Math.min(openUntil, now + cfg.breakerCooldownMs);
+        return true;
+      }
+    } catch {
+      /* fail-soft */
+    }
+    return false;
+  }
+
+  /** One-line file-shared breaker summary for /cognee and /cognee-doctor. */
+  function sharedBreakerSummary(): string {
+    try {
+      const shared = loadSharedBreaker(cfg.baseUrl, sharedBreakerPath());
+      const openUntil = Number(shared.open_until) || 0;
+      const count = Number(shared.consecutive_failures) || 0;
+      return openUntil > Date.now()
+        ? `open until ${new Date(openUntil).toLocaleTimeString()}`
+        : `${count} consecutive failure${count === 1 ? "" : "s"} on record`;
+    } catch {
+      return "unavailable";
+    }
   }
 
   /* ----- Health check + background re-probe ----- */
@@ -332,7 +417,8 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
     }
     state.healthy = false;
     state.lastError = result.error ?? "unreachable";
-    setStatusSafe("✕ cognee: offline");
+    // Same information set as the official statusline (health · backend · dataset).
+    setStatusSafe(`✕ cognee: offline (${cfg.backend} · ${state.dataset})`);
     if (opts.notify && !state.degradedNotified) {
       state.degradedNotified = true;
       notifySafe(
@@ -697,17 +783,30 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
       "Store durable knowledge in the cognee persistent memory graph (survives across sessions). " +
       "WHEN to use: the user states a lasting preference, decision, project convention, correction, or fact " +
       "worth recalling in future sessions — or asks you to remember/save/note something. " +
+      "Per-file ingestion: pass file=<path> (instead of content) to upload one file from disk under its REAL " +
+      "filename — a .py/.ts/... upload routes down the server's zero-LLM code path into the code graph " +
+      "(single file only, no cross-file edges — index the repo for those). The file must exist, be text, " +
+      "fit the size cap, and not look like a credential (~/.ssh, *.pem, .env, id_rsa*, credentials* are refused). " +
       "WHEN NOT to use: ordinary conversation turns are auto-captured into session memory already; " +
-      "do not remember transient details, file contents available on disk, or secrets. " +
+      "do not remember transient details or secrets. " +
       "Choose node_set: user_context (preferences, instructions about the user), project_docs (architecture, " +
-      "conventions, domain knowledge), agent_actions (operational notes about how to work here). " +
+      "conventions, domain knowledge, code files), agent_actions (operational notes about how to work here). " +
       "Ingestion into the graph is asynchronous; the tool briefly waits for the graph to become queryable. " +
       "Output is truncated at 4000 chars.",
     promptSnippet: "Store durable facts, preferences and decisions in cognee persistent memory.",
     parameters: Type.Object({
-      content: Type.String({
-        description: "The knowledge to persist, written as self-contained prose (it will be read without this conversation's context).",
-      }),
+      content: Type.Optional(
+        Type.String({
+          description:
+            "The knowledge to persist, written as self-contained prose (it will be read without this conversation's context). Provide this or file.",
+        }),
+      ),
+      file: Type.Optional(
+        Type.String({
+          description:
+            "Path to a single file on disk to ingest under its real filename (routes code extensions down the zero-LLM code-graph path; no cross-file edges). Takes precedence over content. Must exist, be text, ≤200 KB.",
+        }),
+      ),
       node_set: Type.Optional(
         Type.Union(
           [
@@ -726,6 +825,38 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
       try {
         const dataset = params.dataset ?? state.dataset;
         const nodeSet = params.node_set ?? "user_context";
+        if (params.file) {
+          // Per-file ingestion (mirror of cognee-remember.sh --file): read from
+          // disk guarded, upload VERBATIM under the real basename — the filename
+          // extension is the server's loader-routing signal (code extensions →
+          // zero-LLM code route), so no redaction, no synthetic .txt rename.
+          const read = readRememberFile(params.file, REMEMBER_FILE_MAX_BYTES);
+          if (!read.ok || !read.text || !read.basename) {
+            return textResult(`⚠ cognee_remember file rejected: ${read.error}`, { error: "file" });
+          }
+          const result = await client.remember({
+            content: read.text,
+            filename: read.basename,
+            nodeSet,
+            dataset,
+            externalSignal: signal,
+          });
+          if (!result.ok) return errResult("cognee_remember failed", result.error);
+          let suffix = "";
+          if (result.datasetId) {
+            suffix = ` ${await waitForCognify(result.datasetId, cfg.rememberWaitMs, signal)}`;
+          }
+          return textResult(
+            `Stored file '${read.basename}' (${read.bytes} bytes) in dataset '${dataset}' (node_set: ${nodeSet}) — ` +
+              `code extensions route into the code graph without LLM calls.${suffix}`,
+            { dataset, nodeSet, filename: read.basename, datasetId: result.datasetId },
+          );
+        }
+        if (!params.content || !params.content.trim()) {
+          return textResult("⚠ Provide content (prose) or file (a path on disk) — one of the two is required.", {
+            error: "bad params",
+          });
+        }
         const result = await client.remember({
           // Explicit memory is durable and cross-session — redact secrets on the
           // way in (hardening beyond the official plugins, which only redact
@@ -1102,7 +1233,7 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           `  Auto:      capture ${cfg.capture ? "on" : "off (COGNEE_CAPTURE=false)"} · auto-recall ${cfg.capture ? "on" : "off"} · auto-sync every ${cfg.autoImproveEvery || "∞"} writes`,
           `  Recall:    ${state.turnsWithHits}/${state.totalRecallTurns} turns had hits this session`,
           `  Queue:     ${state.writeQueue.length} buffered · ${state.capturedCount} stored this session${state.droppedCount ? ` · ${state.droppedCount} dropped` : ""}`,
-          `  Breaker:   ${breakerOpen() ? `open until ${new Date(state.breakerOpenUntil).toLocaleTimeString()} (recall paused)` : "closed"}`,
+          `  Breaker:   ${breakerOpen() ? `open until ${new Date(state.breakerOpenUntil).toLocaleTimeString()} (recall paused)` : "closed"} · file-shared (${sharedBreakerSummary()})`,
           codeGraphStatusLine(),
         ];
         report(ctx, lines.join("\n"), health.reachable ? "info" : "warning");
@@ -1135,7 +1266,7 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           `  ${pad("Session")}${state.sessionId || "(not started)"}`,
           `  ${pad("Datasets")}${datasets.ok && datasets.datasets.length ? datasets.datasets.slice(0, 10).map((d) => `${d.name}${d.id ? ` (${d.id.slice(0, 8)}…)` : ""}`).join(", ") : datasets.ok ? "(none readable)" : `unavailable (${describeError(datasets.error)})`}`,
           `  ${pad("Capture")}${cfg.capture ? "on" : "off (COGNEE_CAPTURE=false)"} · stored this session: ${state.capturedCount} · buffered: ${state.writeQueue.length}`,
-          `  ${pad("Breaker")}${breakerOpen() ? `OPEN until ${new Date(state.breakerOpenUntil).toLocaleTimeString()}` : `closed (${state.failureTimestamps.length}/${cfg.breakerThreshold} recent failures)`}`,
+          `  ${pad("Breaker")}${breakerOpen() ? `OPEN until ${new Date(state.breakerOpenUntil).toLocaleTimeString()}` : `closed (${state.failureTimestamps.length}/${cfg.breakerThreshold} recent failures)`} · shared: ${sharedBreakerSummary()}`,
           `  ${pad("Timeouts")}recall ${cfg.recallTimeoutMs}ms · request ${cfg.requestTimeoutMs}ms · health ${cfg.healthTimeoutMs}ms`,
           `  ${pad("Code graph")}${codeGraphStatusLine()}`,
         ];
@@ -1166,22 +1297,28 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
         }
         let content = rest.join(" ");
         let filename: string | undefined;
+        let isFileUpload = false;
         if (file) {
-          const { readFile } = await import("node:fs/promises");
-          const stat = await readFile(file, "utf8");
-          if (Buffer.byteLength(stat) > 200_000) {
-            report(ctx, "File too large (limit 200 KB) — remember a summary instead.", "error");
+          // Per-file ingestion (mirror of cognee-remember.sh --file): guarded
+          // read, uploaded VERBATIM under the real basename so the filename
+          // extension routes code files down the zero-LLM code path.
+          const read = readRememberFile(file, REMEMBER_FILE_MAX_BYTES);
+          if (!read.ok || !read.text || !read.basename) {
+            report(ctx, `Remember failed: ${read.error}`, "error");
             return;
           }
-          content = stat;
-          filename = file.split("/").pop();
+          content = read.text;
+          filename = read.basename;
+          isFileUpload = true;
         }
         if (!content.trim()) {
           report(ctx, "Usage: /cognee-remember <text> [--file <path>] [--node-set user_context|project_docs|agent_actions]", "warning");
           return;
         }
-        // Durable cross-session memory — redact secrets on the way in (files too).
-        content = redactSecrets(content);
+        // Durable cross-session memory — redact secrets on the way in for prose;
+        // file uploads stay verbatim (code must route as code, same as the
+        // official plugins' --file path).
+        if (!isFileUpload) content = redactSecrets(content);
         const result = await client.remember({ content, nodeSet, dataset: state.dataset, filename });
         if (!result.ok) {
           report(ctx, `Remember failed: ${result.error?.message ?? "unknown error"}${result.error?.unreachable ? ` — is the cognee server running at ${cfg.baseUrl}?` : ""}`, "error");
@@ -1189,7 +1326,12 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
         }
         let suffix = "";
         if (result.datasetId) suffix = ` ${await waitForCognify(result.datasetId, cfg.rememberWaitMs)}`;
-        report(ctx, `Remembered ${content.length} chars into '${state.dataset}' (node_set ${nodeSet}).${suffix}`);
+        report(
+          ctx,
+          isFileUpload
+            ? `Stored file '${filename}' (${content.length} chars) in '${state.dataset}' (node_set ${nodeSet}) — code extensions route into the code graph without LLM calls.${suffix}`
+            : `Remembered ${content.length} chars into '${state.dataset}' (node_set ${nodeSet}).${suffix}`,
+        );
       } catch (err) {
         report(ctx, `Remember failed: ${describeError(err)}`, "error");
       }
@@ -1607,10 +1749,10 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
       if (!result.ok) {
         recordFailure(result.error);
         if (result.error?.status === 401 || result.error?.status === 403) {
-          setStatusSafe("✕ cognee: auth failed");
+          setStatusSafe(`✕ cognee: auth failed (${cfg.backend} · ${state.dataset})`);
         } else if (result.error && !result.error.transient && result.error.status !== 0) {
           state.healthy = false;
-          setStatusSafe("✕ cognee: server error");
+          setStatusSafe(`✕ cognee: server error (${cfg.backend} · ${state.dataset})`);
         }
         const skipped = recallSkipped(recallSkipReason(result.error)); // turn proceeds normally
         if (codeSection && skipped.message && typeof skipped.message.content === "string") {
@@ -1677,6 +1819,118 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
       // Code-graph freshness: a turn may have changed the working tree — check
       // (debounced, off the turn's critical path) and re-index in the background.
       scheduleChangeCheck();
+    } catch {
+      /* fail-soft */
+    }
+  });
+
+  /* ----- Pre-compact memory anchor (mirror of pre-compact.py) ----- */
+
+  /** Keyword-dense query from recent turns (same shape as _extract_query_words). */
+  function anchorQueryWords(recentText: string, maxWords = 20): string {
+    const words: string[] = [];
+    for (const match of recentText.toLowerCase().matchAll(/\b\w+\b/g)) {
+      if (match[0].length >= 3) {
+        words.push(match[0]);
+        if (words.length >= maxWords) break;
+      }
+    }
+    return words.join(" ");
+  }
+
+  /** `- Q:/A: <300 chars>` lines — the fallback section pre-compact.py stores. */
+  function anchorSessionSection(turns: { question: string; answer: string }[]): string {
+    const lines: string[] = [];
+    for (const turn of turns.slice(-5)) {
+      for (const [prefix, text] of [
+        ["Q:", turn.question],
+        ["A:", turn.answer],
+      ] as const) {
+        if (!text.trim()) continue;
+        lines.push(`- ${prefix} ${truncateText(text.trim(), ANCHOR_TURN_CHARS)}`);
+      }
+    }
+    return lines.length ? ["### Session Memory (recent turns)", ...lines].join("\n") : "";
+  }
+
+  /**
+   * Build and store the compaction anchor. Scoping mirrors pre-compact.py: one
+   * graph recall (top_k=3, HYBRID_COMPLETION, only_context, scoped to this
+   * session + dataset) seeded by a keyword query built from the transcript
+   * being compacted; when memory has nothing, the raw recent turns stand in.
+   * The anchor is stored as a QA entry in the SESSION CACHE tier (via the same
+   * bounded write queue), so post-compact auto-recall — which is session-scoped —
+   * keeps continuity. Detached and fail-soft: compaction is never blocked.
+   */
+  async function storeCompactAnchor(messages: { role?: string; content?: unknown }[]): Promise<void> {
+    try {
+      if (!cfg.capture || state.stopped || !state.sessionId) return;
+      // What the transcript held: the user/assistant text about to be summarized away.
+      const recent: { question: string; answer: string }[] = [];
+      for (const message of messages.slice(-12)) {
+        const text = extractText(message.content).trim();
+        if (!text || text.startsWith("/")) continue;
+        if (message.role === "user") recent.push({ question: truncateText(redactSecrets(text), LIMITS.promptBytes), answer: "" });
+        else if (message.role === "assistant" && recent.length) {
+          const last = recent[recent.length - 1];
+          last.answer = truncateText(redactSecrets(text), LIMITS.assistantBytes);
+        }
+      }
+      const seedText = recent
+        .slice(-3)
+        .map((t) => `${t.question} ${t.answer}`)
+        .join(" ");
+
+      const sections: string[] = [];
+      if (seedText && state.healthy && !breakerOpen()) {
+        // Primary section, verbatim like the reference (top_k bounds it server-side).
+        const recalled = await client.recall({
+          query: anchorQueryWords(seedText),
+          sessionId: state.sessionId,
+          dataset: state.dataset,
+          topK: 3,
+          searchType: "HYBRID_COMPLETION",
+          onlyContext: true,
+          scope: ["graph"],
+          timeoutMs: cfg.recallTimeoutMs,
+        });
+        if (recalled.ok) {
+          const memoryLines = recalled.items
+            .map((item) => String(item.text ?? item.content ?? "").trim())
+            .filter(Boolean);
+          if (memoryLines.length) sections.push(["### Cognee Memory", ...memoryLines].join("\n"));
+        }
+      }
+      if (!sections.length) {
+        // Memory has nothing yet — the recent turns themselves keep the anchor useful.
+        const fallback = anchorSessionSection(recent);
+        if (fallback) sections.push(fallback);
+      }
+      if (!sections.length) return; // precompact_empty — nothing to preserve
+
+      const anchor = truncateText(
+        "## Cognee Memory Anchor\n" +
+          "Preserved context from Cognee memory (session history, knowledge graph, guidance):\n\n" +
+          sections.join("\n\n"),
+        ANCHOR_MAX_CHARS,
+      );
+      queueQa({
+        type: "qa",
+        question: "Context compaction anchor — what the compacted transcript held",
+        answer: anchor,
+        context: `pi · compaction anchor · dataset ${state.dataset}`,
+      });
+    } catch {
+      /* fail-soft — a compaction is never disturbed */
+    }
+  }
+
+  pi.on("session_before_compact", (event): void => {
+    // Background-safe: detach immediately; compaction proceeds regardless.
+    try {
+      const messages =
+        (event.preparation?.messagesToSummarize as { role?: string; content?: unknown }[] | undefined) ?? [];
+      void storeCompactAnchor(messages).catch(() => {});
     } catch {
       /* fail-soft */
     }

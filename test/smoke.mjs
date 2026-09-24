@@ -211,10 +211,10 @@ await check("parseEnvFile: quotes, export prefix, comments, denylist, last-wins"
   assert.ok(!("PATH" in values), "denylisted key not imported");
 });
 
-await check("loadCogneeConfig honors env overrides (capture opt-out, autoindex, timeouts)", () => {
+await check("loadCogneeConfig honors env overrides (capture opt-out, autoindex, timeouts, remember background)", () => {
   // Regression guard for the blocker where num()/bool() indexed the EnvLookup
   // function object instead of calling it — every override silently ignored.
-  const keys = ["COGNEE_CAPTURE", "COGNEE_CODE_AUTOINDEX", "COGNEE_CODE_INDEX_TIMEOUT_MS"];
+  const keys = ["COGNEE_CAPTURE", "COGNEE_CODE_AUTOINDEX", "COGNEE_CODE_INDEX_TIMEOUT_MS", "COGNEE_REMEMBER_BACKGROUND"];
   const saved = keys.map((k) => process.env[k]);
   try {
     process.env.COGNEE_CAPTURE = "false";
@@ -224,6 +224,13 @@ await check("loadCogneeConfig honors env overrides (capture opt-out, autoindex, 
     assert.equal(cfg.capture, false, "COGNEE_CAPTURE=false disables capture/recall");
     assert.equal(cfg.codeAutoindex, "off", "COGNEE_CODE_AUTOINDEX=off respected");
     assert.equal(cfg.codeIndexTimeoutMs, 45000, "COGNEE_CODE_INDEX_TIMEOUT_MS=45000 respected");
+    assert.equal(cfg.rememberBackground, true, "COGNEE_REMEMBER_BACKGROUND defaults to true");
+    process.env.COGNEE_REMEMBER_BACKGROUND = "false";
+    assert.equal(
+      clientMod.loadCogneeConfig().rememberBackground,
+      false,
+      "COGNEE_REMEMBER_BACKGROUND=false respected (sync remember write)",
+    );
     process.env.COGNEE_CODE_INDEX_TIMEOUT_MS = "not-a-number";
     assert.equal(
       clientMod.loadCogneeConfig().codeIndexTimeoutMs,
@@ -399,6 +406,240 @@ if (gitAvailable) {
   console.log("  skip  git fingerprint checks (git not on PATH)");
   passed++;
 }
+
+await check("cognee_remember tool schema accepts the per-file ingestion param", () => {
+  const remember = recorded.tools.find((t) => t.name === "cognee_remember");
+  assert.ok(remember, "cognee_remember registered");
+  assert.equal(
+    typeof remember.parameters.properties.file,
+    "object",
+    "file param present in the TypeBox schema",
+  );
+  assert.equal(
+    typeof remember.parameters.properties.content,
+    "object",
+    "content param still present",
+  );
+  assert.ok(
+    !Array.isArray(remember.parameters.required) || !remember.parameters.required.includes("content"),
+    "content is optional when file is provided (reference: file_path set → content ignored)",
+  );
+  assert.ok(
+    remember.description.includes("file"),
+    "tool description teaches the per-file code route",
+  );
+});
+
+await check("readRememberFile: exists / size cap / text-only guards, real basename", async () => {
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const os = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync(join(os.tmpdir(), "pi-cognee-file-"));
+  const code = join(dir, "payments.py");
+  writeFileSync(code, "def process_payment():\n    return 'ok'\n");
+  const good = clientMod.readRememberFile(code, 2000);
+  assert.equal(good.ok, true, "text file reads");
+  assert.equal(good.basename, "payments.py", "REAL basename (server's routing signal)");
+  assert.ok(good.text.includes("process_payment"), "content verbatim (no redaction)");
+
+  assert.ok(!clientMod.readRememberFile(join(dir, "missing.ts")).ok, "missing file rejected");
+  const big = join(dir, "big.txt");
+  writeFileSync(big, "x".repeat(100));
+  assert.ok(!clientMod.readRememberFile(big, 50).ok, "oversized file rejected");
+
+  const bin = join(dir, "blob.bin");
+  writeFileSync(bin, Buffer.from([0x61, 0x00, 0x62, 0x63]));
+  const binary = clientMod.readRememberFile(bin, 2000);
+  assert.ok(!binary.ok, "NUL-byte binary rejected");
+  assert.ok(/binary/i.test(binary.error ?? ""), "binary rejection explains itself");
+
+  // Credential-looking paths are refused BEFORE any disk read (these paths don't exist).
+  for (const p of [
+    join(os.homedir(), ".ssh", "id_rsa"),
+    join(dir, ".env"),
+    join(dir, ".env.production"),
+    join(dir, "server.pem"),
+    join(dir, "id_ed25519"),
+    join(dir, "credentials.json"),
+  ]) {
+    const r = clientMod.readRememberFile(p, 2000);
+    assert.ok(!r.ok, `${p} refused`);
+    assert.ok(/secret/i.test(r.error ?? ""), `${p} refusal explains itself`);
+  }
+  // Innocent look-alikes must still pass through to the normal guards.
+  const envish = join(dir, "envelope.ts");
+  writeFileSync(envish, "export const x = 1;\n");
+  assert.equal(clientMod.readRememberFile(envish, 2000).ok, true, ".env* pattern does not over-match");
+});
+
+await check("remember(): run_in_background follows cfg.rememberBackground (COGNEE_REMEMBER_BACKGROUND)", async () => {
+  // No network: stub fetch and inspect the outgoing multipart form field.
+  const realFetch = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = async (_url, opts) => {
+    if (opts?.body instanceof FormData) seen.push(String(opts.body.get("run_in_background")));
+    return { ok: true, status: 200, text: async () => JSON.stringify({ dataset_id: "smoke-ds" }) };
+  };
+  try {
+    const base = clientMod.loadCogneeConfig();
+    const mk = (rememberBackground) =>
+      new clientMod.CogneeClient({
+        ...base,
+        baseUrl: "https://cognee.invalid",
+        apiKey: "smoke-key",
+        rememberBackground,
+      });
+    assert.equal((await mk(true).remember({ content: "hello" })).ok, true, "remember ok (default background)");
+    assert.equal((await mk(false).remember({ content: "hello" })).ok, true, "remember ok (sync default)");
+    assert.equal(
+      (await mk(false).remember({ content: "hello", background: true })).ok,
+      true,
+      "remember ok (explicit background beats cfg)",
+    );
+    assert.deepEqual(
+      seen,
+      ["true", "false", "true"],
+      `run_in_background wire field: cfg default true → cfg false → explicit override; saw [${seen.join(", ")}]`,
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+await check("file-shared breaker round-trips via an injected temp dir (atomic, tolerant)", async () => {
+  const { mkdtempSync, writeFileSync, readdirSync } = await import("node:fs");
+  const os = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync(join(os.tmpdir(), "pi-cognee-breaker-"));
+  const file = join(dir, "breaker.json");
+  const local = "http://localhost:8011";
+  const cloud = "https://cognee.example";
+
+  clientMod.saveSharedBreaker(local, { open_until: 12345, consecutive_failures: 3 }, file);
+  let entry = clientMod.loadSharedBreaker(local, file);
+  assert.equal(entry.open_until, 12345, "open_until round-trips");
+  assert.equal(entry.consecutive_failures, 3, "consecutive_failures round-trips");
+  assert.equal(typeof entry.updated_at, "string", "updated_at stamped");
+
+  clientMod.saveSharedBreaker(cloud, { open_until: 0, consecutive_failures: 1 }, file);
+  entry = clientMod.loadSharedBreaker(local, file);
+  assert.equal(entry.open_until, 12345, "other servers' entries preserved (keyed by base_url)");
+  assert.equal(clientMod.loadSharedBreaker(cloud, file).consecutive_failures, 1, "second entry reads");
+
+  clientMod.saveSharedBreaker(local, { open_until: 0, consecutive_failures: 0 }, file);
+  assert.equal(clientMod.loadSharedBreaker(local, file).open_until, 0, "reset write lands");
+
+  writeFileSync(file, "{not json at all", "utf8");
+  assert.deepEqual(clientMod.loadSharedBreaker(local, file), {}, "corrupt file tolerated as empty");
+  assert.deepEqual(
+    clientMod.loadSharedBreaker(local, join(dir, "absent.json")),
+    {},
+    "missing file tolerated as empty",
+  );
+  clientMod.saveSharedBreaker(local, { open_until: 1, consecutive_failures: 1 }, file); // rewrite over corruption
+  assert.equal(clientMod.loadSharedBreaker(local, file).open_until, 1, "save over a corrupt file heals it");
+  assert.equal(
+    readdirSync(dir).filter((n) => n.endsWith(".tmp")).length,
+    0,
+    "atomic write leaves no temp files behind",
+  );
+});
+
+await check("pre-compact anchor handler registered on session_before_compact, detached + fail-soft", async () => {
+  const handlers = recorded.events.get("session_before_compact") ?? [];
+  assert.ok(handlers.length >= 1, "session_before_compact handler registered");
+  const handler = handlers[handlers.length - 1];
+  assert.equal(typeof handler, "function", "handler is a function");
+  assert.ok(handler.length >= 1, "handler takes (event[, ctx])");
+
+  // No network: stub fetch to reject before exercising the runtime wiring.
+  const realFetch = globalThis.fetch;
+  const statusCalls = [];
+  let poisonTripped = false;
+  globalThis.fetch = async () => {
+    throw new Error("smoke: no network");
+  };
+  try {
+    // Mode-guard check part 1: hasUI=false must never touch ui.setStatus.
+    const { pi: piNoUi, recorded: recNoUi } = makeStubApi();
+    factory(piNoUi);
+    const startNoUi = recNoUi.events.get("session_start")[0];
+    startNoUi(
+      { type: "session_start", reason: "startup" },
+      {
+        hasUI: false,
+        ui: {
+          setStatus() {
+            poisonTripped = true;
+          },
+          notify() {
+            poisonTripped = true;
+          },
+        },
+        cwd: process.cwd(),
+        sessionManager: { getSessionId: () => "smoke-no-ui" },
+      },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.ok(!poisonTripped, "ui.setStatus/notify never called when hasUI is false (mode-guarded)");
+    await recNoUi.events.get("session_shutdown")[0]({ type: "session_shutdown", reason: "quit" });
+
+    // Part 2: with a UI, the failing health probe lands in setStatus.
+    const { pi: piUi, recorded: recUi } = makeStubApi();
+    factory(piUi);
+    const ctx = {
+      hasUI: true,
+      ui: {
+        setStatus(_key, text) {
+          statusCalls.push(text);
+        },
+        notify() {},
+      },
+      cwd: process.cwd(),
+      sessionManager: { getSessionId: () => "smoke-ui" },
+    };
+    recUi.events.get("session_start")[0]({ type: "session_start", reason: "startup" }, ctx);
+    // Health probe fires on a 0ms timer; the unreachable retry adds ~300ms.
+    for (let i = 0; i < 40 && statusCalls.length === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.ok(statusCalls.length >= 1, "setStatus called at the health-probe point when hasUI is true");
+    assert.ok(
+      statusCalls[0].startsWith("✕ cognee: offline"),
+      `status text carries health + backend + dataset: ${statusCalls[0]}`,
+    );
+    assert.ok(statusCalls[0].includes("·"), "status text names backend · dataset");
+
+    // Anchor: firing the compact event returns synchronously (background-safe)…
+    const compactHandler = (recUi.events.get("session_before_compact") ?? [])[0];
+    const out = compactHandler(
+      {
+        type: "session_before_compact",
+        preparation: {
+          messagesToSummarize: [
+            { role: "user", content: "We decided the breaker state file is shared across processes" },
+            { role: "assistant", content: [{ type: "text", text: "Stored the decision." }] },
+          ],
+          turnPrefixMessages: [],
+          isSplitTurn: false,
+          tokensBefore: 100,
+          fileOps: { readFiles: [], modifiedFiles: [] },
+          settings: {},
+        },
+        branchEntries: [],
+        reason: "manual",
+        willRetry: false,
+        signal: new AbortController().signal,
+      },
+      ctx,
+    );
+    assert.equal(out, undefined, "handler detaches (returns void immediately, compaction never blocked)");
+    await new Promise((resolve) => setTimeout(resolve, 100)); // detached anchor settles fail-soft
+    await recUi.events.get("session_shutdown")[0]({ type: "session_shutdown", reason: "quit" });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
 
 await check("factory leaves no pending timers (no long-lived resources)", async () => {
   // Final re-check after all fixtures: no timer/handle leaked from the checks above.
