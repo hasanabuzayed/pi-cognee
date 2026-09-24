@@ -14,18 +14,36 @@ import type {
   ExtensionContext,
   ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
-import { resolve as pathResolve } from "node:path";
+import { resolve as pathResolve, dirname as pathDirname } from "node:path";
+import { join as pathJoin } from "node:path";
+import { readFileSync } from "node:fs";
+import {
+  PINNED_COGNEE_VERSION,
+  bootstrapPaths,
+  cogneeEnvLookup,
+  ensureLocalServerRunning,
+  findUv,
+  logBootstrapEvent,
+  serverPidfileStatus,
+  serverPort,
+  serverPresence,
+  venvCogneeVersion,
+} from "./bootstrap";
 import {
   CogneeClient,
   CogneeError,
   DEFAULT_BREAKER_FILE,
+  DEFAULT_CAPTURE_TOOLS,
   REMEMBER_FILE_MAX_BYTES,
   buildCodeQuery,
+  buildTraceEntry,
   canonicalRepoSpec,
+  clearAgentKeyRecord,
   codeDatasetName,
   countSourceFiles,
   describeError,
   extractIdentifiers,
+  extractText,
   findIndexedRepo,
   gitFingerprint,
   gitRepoRoot,
@@ -36,14 +54,19 @@ import {
   loadCogneeConfig,
   loadRepoStates,
   loadSharedBreaker,
+  loadSharedMemoryMarker,
+  logPluginEvent,
+  piStateDir,
   matchDatasets,
   mintSwitchSessionId,
   activeDatasetPath,
+  principalFingerprint,
   readRememberFile,
   redactSecrets,
   sanitizeDatasetName,
   sanitizeSessionId,
   saveActiveDatasetRecord,
+  saveAgentKeyRecord,
   saveRepoState,
   saveSharedBreaker,
   truncateText,
@@ -54,7 +77,37 @@ import {
   type HealthResult,
   type QaEntry,
   type RecallItem,
+  type TraceEntry,
 } from "./client";
+import {
+  AGENT_ROLE_NAME,
+  PROVISIONING_PLUGIN_VERSION,
+  STRUCTURAL_SHARED_MEMORY_FAILURES,
+  type SharedMemoryOutcome,
+} from "./provisioning";
+import {
+  bumpStoredCounter,
+  improveThrottleReason,
+  readImproveState,
+  readStoredCounter,
+  recordImproveFailure,
+  recordImproveSuccess,
+} from "./improve-state";
+import {
+  appendBridge,
+  bridgeBackoffOpen,
+  entryFingerprint,
+  loadBridge,
+  markBridgeHeadAmbiguous,
+  oldestPendingBridgeHead,
+  recordBridgeFailure,
+  resetBridgeFailures,
+  serverFingerprints,
+  sweepOldBridgeFiles,
+  trimBridgeHead,
+  writeOutcomeAmbiguous,
+  type SpilledEntry,
+} from "./bridge";
 
 /** A captured QA entry BOUND to the session+dataset it was captured under.
  *  Binding happens at capture time so a later dataset switch can never
@@ -62,6 +115,15 @@ import {
  *  pending entries to the retired triple the same way). The binding is
  *  plugin-internal — it is stripped before the wire payload is built. */
 type BoundQaEntry = QaEntry & { sessionId: string; dataset: string };
+
+/** A captured tool-call trace entry with the same capture-time binding. */
+type BoundTraceEntry = TraceEntry & { sessionId: string; dataset: string };
+
+/** Any queued entry as seen by the drain: bound + the bridge's replay meta. */
+type PendingEntry = (BoundQaEntry | BoundTraceEntry) & {
+  _replay_ambiguous?: true;
+  _buffered_at?: number;
+};
 
 /* ------------------------------------------------------------------ */
 /* Limits (aligned with the official plugins' capture policy)          */
@@ -103,18 +165,16 @@ const ANCHOR_TURN_CHARS = 300;
 /** Whole-anchor cap — the anchor is a session-cache QA answer, keep it bounded. */
 const ANCHOR_MAX_CHARS = 8000;
 
-function extractText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .filter((block): block is { type: string; text?: string } =>
-        Boolean(block) && typeof block === "object" && (block as { type?: string }).type === "text",
-      )
-      .map((block) => block.text ?? "")
-      .join("\n");
-  }
-  return "";
-}
+/* Statusline (v0.4 resilience spec §2.1) — plain text, no ANSI (pi's footer
+ * renders plain; glyphs carry the semantics — documented divergence). */
+/** Soft visible-char cap; segments drop in reverse priority order before any mid-segment cut. */
+const STATUSLINE_MAX_CHARS = 120;
+/** Credits marker freshness horizons (reference parity: 7 d max, 15 m age hint). */
+const CREDITS_MAX_AGE_SECONDS = 7 * 24 * 60 * 60;
+const CREDITS_AGE_HINT_SECONDS = 15 * 60;
+/** Low-balance threshold that appends the top-up hint (reference _CREDITS_LOW_USD). */
+const CREDITS_LOW_USD = 1.0;
+const DEFAULT_BILLING_URL = "https://platform.cognee.ai/billing";
 
 function randomId(): string {
   return Math.random().toString(36).slice(2, 10);
@@ -242,11 +302,15 @@ export function codeItemHasData(item: RecallItem): boolean {
  * `Current dataset: X (session Y)` header, one row per readable dataset with the
  * active one starred (` * name (id8…)`), plus the reference's guidance that a
  * one-off LOOK in another dataset needs no switch (per-call dataset overrides).
+ * `extraLines` carries the writability notes the reference prints verbatim:
+ * `(N read-only dataset(s) not shown)` / `(write access could not be
+ * verified — showing every readable dataset)` (v0.4, spec §3.6).
  */
 export function renderDatasetList(
   currentDataset: string,
   sessionId: string,
   datasets: { name: string; id: string }[],
+  extraLines: string[] = [],
 ): string {
   const rows = datasets.length
     ? datasets.map((d) => {
@@ -257,6 +321,7 @@ export function renderDatasetList(
   return [
     `Current dataset: ${currentDataset} (session ${sessionId || "(not started)"})`,
     ...rows,
+    ...extraLines,
     "",
     "Switch: /cognee-datasets <name> — syncs the current session, mints a new session id,",
     "and re-points capture/recall/sync (unlisted names are created on switch; --force",
@@ -273,6 +338,22 @@ export function renderDatasetList(
 export default function cogneeExtension(pi: ExtensionAPI): void {
   const cfg: CogneeConfig = loadCogneeConfig();
   const client = new CogneeClient(cfg);
+
+  /* Shared-memory addressing seed (v0.4): the persisted record's UUIDs win
+   * (a dataset match is implied — the record's dataset IS cfg.dataset), else
+   * the live marker's canonical map (the reference's launch-record →
+   * marker-canonical precedence, dataset_id_for). Empty → name addressing. */
+  const initialMarker = loadSharedMemoryMarker(cfg.baseUrl);
+  const initialCanonicalId =
+    cfg.sharedAgentMemory && initialMarker.mode === "shared"
+      ? initialMarker.canonical?.[cfg.dataset] ?? ""
+      : "";
+  const initialSharedDatasetId = cfg.sharedDatasetId || initialCanonicalId;
+  const initialSharedDatasetIds = cfg.sharedDatasetIds?.length
+    ? cfg.sharedDatasetIds
+    : initialSharedDatasetId
+      ? [initialSharedDatasetId]
+      : [];
 
   /** Suffix for graph-read tool descriptions when federated reads are configured
    *  (the reference teaches the model about the widened read set only when set). */
@@ -301,8 +382,21 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
     datasetSwitchedAt: cfg.datasetSwitchedAt ?? null,
     pendingQuestion: null as string | null,
     pendingAnswer: null as string | null,
-    writeQueue: [] as BoundQaEntry[],
+    writeQueue: [] as (BoundQaEntry | BoundTraceEntry)[],
     draining: false,
+    /* connection verdict for the statusline glyph slot (single left slot,
+     * reference precedence: connection failure > llm-key > server signal) */
+    connState: "unknown" as "unknown" | "ok" | "offline" | "auth" | "server-error",
+    /* last recall turn's hit counts (statusline recall segment, spec §2.1) */
+    lastRecallHits: 0,
+    lastGraphHits: 0,
+    lastCodeHits: 0,
+    /* idle bridge (spec §2.2): the single arm timer + its one re-arm */
+    idleTimer: undefined as ReturnType<typeof setTimeout> | undefined,
+    /* per-target improve re-entry guard (server busy-locks per session) */
+    improvesInFlight: new Set<string>(),
+    /* verify-before-replay consumptions (surfaced by /cognee) */
+    dedupedCount: 0,
     /* re-entry guard for the dataset-switch command (in-process analog of the reference .switch.lock) */
     switching: false,
     /* sessions retired by a --force switch past a failed sync: finalSync promotes them too */
@@ -310,7 +404,6 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
     capturedCount: 0,
     droppedCount: 0,
     lastImprovedCount: 0,
-    lastAutoImproveAt: 0,
     totalRecallTurns: 0,
     turnsWithHits: 0,
     finalSyncDone: false,
@@ -322,6 +415,14 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
     autoIndexTried: false,
     lastCodeSubmitAt: 0,
     codeReindexTimer: undefined as ReturnType<typeof setTimeout> | undefined,
+    /* local server bootstrap (v0.4) — once per pi process */
+    bootstrapStarted: false,
+    bootstrapStatus: "idle" as "idle" | "running" | "done" | "failed",
+    bootstrapError: undefined as string | undefined,
+    /* shared-agent-memory provisioning (v0.4) — once per session, after health */
+    provisioningDone: false,
+    sharedDatasetId: initialSharedDatasetId,
+    sharedDatasetIds: initialSharedDatasetIds,
   };
 
   /* ----- UI helpers (mode-guarded, fail-soft) ----- */
@@ -342,6 +443,192 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
     }
   }
 
+  /* ----- Rich statusline (v0.4 resilience spec §2.1) -----
+   *
+   * One plain-text line (no ANSI — pi's footer renders plain, glyphs carry the
+   * semantics; documented divergence from the reference's bold/color policy):
+   *
+   *   <glyph>cognee: <backend> · <dataset>[ · N awaiting replay][ · N memory
+   *   hits[ · X/Y turns had hits this session]][ · credits: …]
+   *
+   * Reads ONLY in-memory state + the one shared credits marker; never throws;
+   * refreshed at the spec's points (health completion, recall, drain tick,
+   * improve settle, dataset switch) — no timers. */
+
+  /** Statusline opt-out probe (reference env names): false|0|no|off hides. */
+  function statuslineEnvOff(name: string): boolean {
+    const raw = (process.env[name] ?? "").trim().toLowerCase();
+    return raw !== "" && ["false", "0", "no", "off"].includes(raw);
+  }
+
+  function statuslineCountsFull(): boolean {
+    return (process.env.COGNEE_STATUSLINE_COUNTS ?? "").trim().toLowerCase() === "full";
+  }
+
+  /** The shared credits marker written by the Claude Code/Codex plugin (pi
+   *  never writes it — render-only, spec §2.1). Honors an explicit
+   *  COGNEE_CREDITS_FILE; otherwise sits beside piStateDir()'s parent like the
+   *  reference layout (~/.cognee-plugin/claude-code/credits.json). */
+  function creditsFilePath(): string {
+    return (
+      process.env.COGNEE_CREDITS_FILE ||
+      pathJoin(pathDirname(piStateDir()), "claude-code", "credits.json")
+    );
+  }
+
+  interface CreditsView {
+    remainingUsd: number;
+    ageSeconds: number;
+    lastOpLabel?: string;
+    lastOpCost?: number;
+  }
+
+  /** Render-only read of the shared credits map (gating: cloud mode, matching
+   *  base_url, numeric balance, age ≤ 7 d). Never throws. */
+  function readCreditsView(): CreditsView | undefined {
+    try {
+      if (cfg.backend !== "cloud") return undefined;
+      if (statuslineEnvOff("COGNEE_STATUSLINE_CREDITS")) return undefined;
+      const raw = JSON.parse(readFileSync(creditsFilePath(), "utf8")) as Record<string, unknown>;
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+      for (const entry of Object.values(raw)) {
+        if (!entry || typeof entry !== "object") continue;
+        const e = entry as Record<string, unknown>;
+        const baseUrl = typeof e.base_url === "string" ? e.base_url.replace(/\/+$/, "") : "";
+        if (baseUrl !== cfg.baseUrl) continue;
+        const remaining = Number(e.remaining_usd);
+        const checkedAtRaw = Number(e.checked_at);
+        if (!Number.isFinite(remaining) || !Number.isFinite(checkedAtRaw)) continue;
+        // The reference markers carry epoch SECONDS (verified against live
+        // conn-state/improve-state files); tolerate either unit.
+        const checkedAt = checkedAtRaw < 1e11 ? checkedAtRaw * 1000 : checkedAtRaw;
+        const ageSeconds = Math.max(0, (Date.now() - checkedAt) / 1000);
+        if (ageSeconds > CREDITS_MAX_AGE_SECONDS) continue;
+        const lastOp =
+          e.last_op && typeof e.last_op === "object" ? (e.last_op as Record<string, unknown>) : undefined;
+        return {
+          remainingUsd: remaining,
+          ageSeconds,
+          lastOpLabel: typeof lastOp?.label === "string" && lastOp.label ? lastOp.label : undefined,
+          lastOpCost: Number.isFinite(Number(lastOp?.cost_usd)) ? Number(lastOp?.cost_usd) : undefined,
+        };
+      }
+      return undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  function creditsAgeHint(ageSeconds: number): string {
+    if (ageSeconds < 60) return "0m ago";
+    if (ageSeconds < 3600) return `${Math.max(1, Math.round(ageSeconds / 60))}m ago`;
+    if (ageSeconds < 24 * 3600) return `${Math.round(ageSeconds / 3600)}h ago`;
+    return `${Math.round(ageSeconds / (24 * 3600))}d ago`;
+  }
+
+  /** Compose the full statusline from state (+ the credits marker). Never throws. */
+  function composeStatusline(): string {
+    try {
+      const base = `${cfg.backend} · ${state.dataset}`;
+      let head: string;
+      if (state.connState === "ok") {
+        // Reference precedence note: the static llm-key verdict sits BELOW a
+        // connection failure but ABOVE the ready signal (§1.1 glyph slot).
+        head =
+          cfg.backend === "local" && !cfg.llmApiKeyConfigured
+            ? `✕ cognee: llm key not set (${base})`
+            : `● cognee: ${base}`;
+      } else if (state.connState === "offline") {
+        head = `✕ cognee: offline (${base})`;
+      } else if (state.connState === "auth") {
+        head = `✕ cognee: auth failed (${base})`;
+      } else if (state.connState === "server-error") {
+        head = `✕ cognee: server error (${base})`;
+      } else {
+        head = `cognee: ${base}`; // unknown — no glyph yet (reference: no marker, no glyph)
+      }
+
+      // Segments; each entry carries whether it may be dropped at the width cap.
+      const segments: { text: string; drop: boolean }[] = [];
+      const pending = pendingWriteCount();
+      if (pending > 0) segments.push({ text: `${pending} awaiting replay`, drop: false });
+      if (!statuslineEnvOff("COGNEE_STATUSLINE_COUNTS")) {
+        if (statuslineCountsFull()) {
+          if (state.totalRecallTurns > 0) {
+            segments.push({ text: `recall ${state.lastGraphHits}g/${state.lastCodeHits}c`, drop: true });
+          }
+        } else if (state.totalRecallTurns > 0) {
+          segments.push({ text: `${state.lastRecallHits} memory hits`, drop: false });
+          if (state.turnsWithHits === 0) {
+            segments.push({ text: `memory warming up (${state.totalRecallTurns} turns)`, drop: true });
+          } else {
+            segments.push({
+              text: `${state.turnsWithHits}/${state.totalRecallTurns} turns had hits this session`,
+              drop: true,
+            });
+          }
+        }
+      }
+      // Credits pieces are assembled separately so the width cap can shed them
+      // in the spec's order: age hint → last-op → whole segment.
+      const credits = readCreditsView();
+      const creditsBits = { base: "", age: "", lastOp: "", topUp: "" };
+      if (credits) {
+        creditsBits.base = `credits: $${credits.remainingUsd.toFixed(2)}`;
+        if (credits.ageSeconds > CREDITS_AGE_HINT_SECONDS) {
+          creditsBits.age = ` (${creditsAgeHint(credits.ageSeconds)})`;
+        }
+        if (credits.lastOpLabel && credits.lastOpCost !== undefined) {
+          creditsBits.lastOp = ` · last ${credits.lastOpLabel} ~$${credits.lastOpCost.toFixed(2)}`;
+        }
+        if (credits.remainingUsd <= CREDITS_LOW_USD) {
+          creditsBits.topUp = ` · top up: ${process.env.COGNEE_BILLING_URL || DEFAULT_BILLING_URL}`;
+        }
+      }
+
+      const assemble = (): string =>
+        head +
+        segments.filter((s) => s.text).map((s) => ` · ${s.text}`).join("") +
+        (creditsBits.base
+          ? ` · ${creditsBits.base}${creditsBits.age}${creditsBits.lastOp}${creditsBits.topUp}`
+          : "");
+      // Soft cap 120 visible chars — shed pieces in the spec's reverse priority
+      // order (age hint → last op → credits → cumulative turns → per-turn hits)
+      // before ever truncating mid-segment.
+      const cumulativeIdx = segments.findIndex((s) => s.drop && /turns|warming/.test(s.text));
+      const perTurnIdx = segments.findIndex((s) => s.text.endsWith("memory hits"));
+      const removals: Array<() => void> = [
+        () => (creditsBits.age = ""),
+        () => (creditsBits.lastOp = ""),
+        () => ((creditsBits.base = ""), (creditsBits.age = ""), (creditsBits.lastOp = ""), (creditsBits.topUp = "")),
+      ];
+      if (cumulativeIdx >= 0) removals.push(() => (segments[cumulativeIdx].text = ""));
+      if (perTurnIdx >= 0) removals.push(() => (segments[perTurnIdx].text = ""));
+      let line = assemble();
+      for (const removal of removals) {
+        if (line.length <= STATUSLINE_MAX_CHARS) break;
+        removal();
+        line = assemble();
+      }
+      return line.length > STATUSLINE_MAX_CHARS ? line.slice(0, STATUSLINE_MAX_CHARS) : line;
+    } catch {
+      return `cognee: ${cfg.backend} · ${state.dataset}`; // never throw from a render path
+    }
+  }
+
+  function renderStatusline(): void {
+    setStatusSafe(composeStatusline());
+  }
+
+  /** Durable pending-write count (memory queue + the session's spill file). */
+  function pendingWriteCount(): number {
+    try {
+      return state.writeQueue.length + loadBridge(state.sessionId).length;
+    } catch {
+      return state.writeQueue.length;
+    }
+  }
+
   function report(ctx: ExtensionContext, message: string, type: "info" | "warning" | "error" = "info"): void {
     try {
       if (ctx.hasUI) ctx.ui.notify(message, type);
@@ -357,6 +644,15 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
       const repo = state.cwd ? findIndexedRepo(state.cwd) : undefined;
       const when = repo?.last_index_at ? ` · indexed ${new Date(repo.last_index_at).toLocaleTimeString()}` : "";
       return `autoindex ${cfg.codeAutoindex}${repo?.dataset ? ` · ${repo.dataset} (${repo.spec_kind})${when}` : " · no indexed repo for cwd"}`;
+    } catch {
+      return "unavailable";
+    }
+  }
+
+  /** Shared-venv cognee version for the doctor's Local runtime row ("" → not built). */
+  async function localRuntimeVersion(): Promise<string> {
+    try {
+      return (await venvCogneeVersion(bootstrapPaths().venvPython, 5000)) || "not built";
     } catch {
       return "unavailable";
     }
@@ -393,6 +689,35 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
       return ids.length
         ? `${ids.length} read dataset${ids.length === 1 ? "" : "s"} via COGNEE_PLUGIN_READ_DATASET_IDS (${cfg.readDatasetIdsSource}) — graph reads only; writes stay on '${state.dataset}'`
         : "off (set COGNEE_PLUGIN_READ_DATASET_IDS to federate graph recall)";
+    } catch {
+      return "unavailable";
+    }
+  }
+
+  /** Capture-policy summary for /cognee-doctor (v0.4 traces): tool allowlist,
+   *  deny extras, redaction state, custom patterns — plus the exact parse
+   *  errors for any malformed COGNEE_CAPTURE_* value (never fatal). */
+  function capturePolicySummary(): string {
+    try {
+      const isDefaultToolSet =
+        cfg.captureTools.length === DEFAULT_CAPTURE_TOOLS.length &&
+        DEFAULT_CAPTURE_TOOLS.every((t, i) => t === cfg.captureTools[i]);
+      const warn: string[] = [];
+      if (cfg.captureToolsError) warn.push(`✕ ${cfg.captureToolsError} — using the default tool set`);
+      if (cfg.captureDenyPathsError) warn.push(`✕ ${cfg.captureDenyPathsError} — extra deny patterns ignored`);
+      if (cfg.captureRedactPatternsError) warn.push(`✕ ${cfg.captureRedactPatternsError} — custom redaction patterns ignored`);
+      if (cfg.captureRedactPatternsSkipped?.length) {
+        warn.push(
+          `✕ skipped invalid regex${cfg.captureRedactPatternsSkipped.length === 1 ? "" : "es"}: ${cfg.captureRedactPatternsSkipped.join(", ")}`,
+        );
+      }
+      const line =
+        `traces: ${cfg.captureTools.length} tool pattern${cfg.captureTools.length === 1 ? "" : "s"}${isDefaultToolSet ? " (default set)" : ""}` +
+        ` · deny extras: ${cfg.captureDenyPaths.length}` +
+        ` · redact ${cfg.captureRedact ? "on" : "off (COGNEE_CAPTURE_REDACT=false)"}` +
+        ` · custom patterns: ${cfg.captureRedactPatterns.length}`;
+      const pad = " ".repeat(15); // align under the row label
+      return warn.length ? `${line}\n${pad}${warn.join(`\n${pad}`)}` : line;
     } catch {
       return "unavailable";
     }
@@ -497,6 +822,263 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
     }
   }
 
+  /* ----- Local server bootstrap (v0.4) -----
+   *
+   * Fires at most once per pi process, only from async trigger points (never
+   * the factory, never a tool's synchronous path): T1 = session_start's
+   * background timer, T2 = runHealthCheck reporting unreachable (which the
+   * 60s re-probe loop keeps hitting while unhealthy). A quick presence probe
+   * (~2.5s budget) decides: ready/busy → nothing (the normal health path
+   * covers ready; a busy server must never be booted over), absent/unknown →
+   * the bootstrap task runs un-awaited. All internal gates re-apply inside
+   * ensureLocalServerRunning (adopt-first, presence licensing, boot lock). */
+
+  function bootstrapStateSuffix(): string {
+    if (state.bootstrapStatus === "idle") return "";
+    const err = state.bootstrapError ? ` — ${truncateText(state.bootstrapError.split("\n")[0], 160)}` : "";
+    return ` · bootstrap: ${state.bootstrapStatus}${err}`;
+  }
+
+  async function maybeBootstrap(): Promise<void> {
+    try {
+      if (!cfg.localBootstrap) return; // COGNEE_LOCAL_BOOTSTRAP=off → v0.3 behavior
+      // Forced-cloud-missing-URL never boots (parity with session-start.py:2003-2007).
+      if (cfg.backend !== "local" || cfg.missingBaseUrl || !isLoopbackUrl(cfg.baseUrl)) return;
+      if (state.bootstrapStarted) return; // once per pi process — synchronous guard
+      state.bootstrapStarted = true;
+      const presence = await serverPresence(cfg.baseUrl, { confirmAbsent: false });
+      if (presence.verdict === "ready" || presence.verdict === "busy") {
+        logBootstrapEvent({ event: "bootstrap_skipped_server_present", verdict: presence.verdict });
+        return;
+      }
+      await runBootstrapTask();
+    } catch (err) {
+      state.bootstrapStatus = "failed";
+      state.bootstrapError = describeError(err);
+    }
+  }
+
+  async function runBootstrapTask(): Promise<void> {
+    state.bootstrapStatus = "running";
+    setStatusSafe(`◐ cognee: starting (local · ${state.dataset})`);
+    notifySafe(
+      "Cognee local server starting — first run may take a few minutes (uv venv + install). " +
+        "Prompts work normally; memory activates when it's up.",
+      "info",
+    );
+    try {
+      const result = await ensureLocalServerRunning(cfg.baseUrl, cogneeEnvLookup(), {
+        healthTimeoutMs: cfg.serverBootDeadlineS * 1000,
+      });
+      state.bootstrapStatus = result.ok ? "done" : "failed";
+      state.bootstrapError = result.ok ? undefined : result.error;
+    } catch (err) {
+      state.bootstrapStatus = "failed";
+      state.bootstrapError = describeError(err);
+    } finally {
+      // The existing health path takes it from here: ●/✕ status, owner-key mint,
+      // dataset ensure, write-queue drain (the guard makes this re-entry a no-op).
+      void runHealthCheck({ notify: true }).catch(() => {});
+    }
+  }
+
+  /* ----- Shared-agent-memory provisioning flow (v0.4, spec §3.4) -----
+   *
+   * Fires once per session AFTER the background health check resolves
+   * (never the factory, never a tool's synchronous path), bounded by a ≤10 s
+   * budget, entirely fail-soft: capability probe → ensurePluginIdentity (mode
+   * matrix of §1.2, structural-reason memo keyed on the plugin version) →
+   * ensureSharedMemory(dataset) → on `shared`, pin the canonical UUIDs into
+   * the in-memory lanes and the persisted active-dataset record; on
+   * `separated`, pin empty ids. Rollback paths of §1.6 (revert-after-provision,
+   * rejected key) implemented with the same log events. */
+
+  /** The canonical UUID to WRITE a dataset name under (reference dataset_id_for):
+   *  the in-memory shared state when it names the active dataset, else the live
+   *  marker's canonical map (only while shared memory is live — after an opt-out
+   *  the plugin writes name-addressed). "" → address by name. */
+  function datasetIdFor(name: string): string {
+    if (!name) return "";
+    if (name === state.dataset && state.sharedDatasetId) return state.sharedDatasetId;
+    if (!cfg.sharedAgentMemory) return "";
+    const marker = loadSharedMemoryMarker(cfg.baseUrl);
+    if (marker.mode !== "shared") return "";
+    return marker.canonical?.[name] ?? "";
+  }
+
+  /** The shared-memory recall read set for the session dataset (precedence #2
+   *  after env federation — the client handles the ordering). */
+  function sharedReadIds(): string[] | undefined {
+    return state.sharedDatasetIds.length ? state.sharedDatasetIds : undefined;
+  }
+
+  function applySharedOutcome(shared: SharedMemoryOutcome): void {
+    if (shared.mode === "shared" && shared.dataset_id) {
+      state.sharedDatasetId = shared.dataset_id;
+      state.sharedDatasetIds = shared.dataset_ids.length ? shared.dataset_ids : [shared.dataset_id];
+      persistSharedIdsIntoRecord();
+    } else {
+      state.sharedDatasetId = "";
+      state.sharedDatasetIds = [];
+    }
+  }
+
+  /** Merge the resolved UUIDs into the persisted active-dataset record when one
+   *  exists and still names this dataset (the reference serializes against the
+   *  switch lock and pins by dataset name — our in-process analog). Fail-soft. */
+  function persistSharedIdsIntoRecord(): void {
+    try {
+      if (state.switching) return;
+      const fp = client.keyFingerprint();
+      const record = loadActiveDatasetRecord(cfg.baseUrl, fp);
+      if (!record || record.dataset !== state.dataset) return;
+      const ids = state.sharedDatasetIds;
+      if (record.dataset_id === state.sharedDatasetId && sameIds(record.dataset_ids, ids)) return;
+      saveActiveDatasetRecord({ ...record, dataset_id: state.sharedDatasetId, dataset_ids: ids });
+    } catch {
+      /* fail-soft */
+    }
+  }
+
+  function sameIds(a: string[] | undefined, b: string[]): boolean {
+    return (a ?? []).length === b.length && (a ?? []).every((v, i) => v === b[i]);
+  }
+
+  async function runProvisioningFlow(): Promise<void> {
+    try {
+      if (state.provisioningDone || state.stopped || !state.healthy || cfg.missingBaseUrl) return;
+      state.provisioningDone = true;
+      const deadline = Date.now() + 10_000;
+      const remaining = () => Math.max(1000, Math.min(10_000, deadline - Date.now()));
+      await client.ensureAuth().catch(() => {});
+      const principal = client.principalKey();
+      if (!principal) return; // no principal → no provisioning, no wiring (§1.2)
+      // Re-read the identity cache like the reference does under its lock at
+      // session start: another process may have provisioned since construction.
+      client.refreshAgentIdentity();
+      const strict = cfg.pluginIdentity === "enabled";
+
+      // A cached key that passes its checks ALWAYS wins — provisioning again
+      // would rotate it out from under every other machine of this user.
+      let agentKey = client.activeAgentKey;
+      let provisionedNow = false;
+      if (!agentKey) {
+        const problemKind = client.identityProblemKind;
+        if (problemKind === "blocked" || problemKind === "principal_mismatch") {
+          // A rejected or foreign cached identity is never used — and never
+          // re-provisioned past (create-only refuses an existing agent;
+          // rotating would revoke another machine's key). Strict → one-line
+          // warning; auto → skip + log (the launch runs as the principal).
+          if (strict) {
+            notifySafe(`Cognee plugin identity: ${client.identityProblem}`, "warning");
+          } else {
+            logPluginEvent({ event: "plugin_identity_skipped", reason: problemKind });
+          }
+          return;
+        }
+        if (!strict) {
+          if (!cfg.sharedAgentMemory) return; // identity in auto mode serves shared memory only
+          const marker = loadSharedMemoryMarker(cfg.baseUrl);
+          const prior = String(marker.reason ?? "");
+          if (STRUCTURAL_SHARED_MEMORY_FAILURES.has(prior)) {
+            // Structural for the plugin version that recorded it; after an update
+            // the limitation may be gone — try once more instead of never again.
+            if (marker.plugin_version === PROVISIONING_PLUGIN_VERSION) {
+              logPluginEvent({ event: "plugin_provision_skipped", status: `shared_memory_${prior}` });
+              return;
+            }
+            logPluginEvent({ event: "plugin_provision_retry_after_update", prior_reason: prior });
+          }
+        }
+        const result = await client.provisionPluginAgent(remaining());
+        if (result.status !== "provisioned") {
+          if (strict) {
+            notifySafe(
+              `Cognee plugin provisioning ${result.status}; owner fallback is disabled — safe create-only SDK support is required.`,
+              "warning",
+            );
+          } else {
+            // auto: no identity on this server — the principal sees everything
+            // anyway, so shared memory has nothing to add.
+            logPluginEvent({ event: "plugin_provision_skipped", status: result.status });
+          }
+          return;
+        }
+        saveAgentKeyRecord({
+          base_url: cfg.baseUrl,
+          api_key: result.apiKey!,
+          agent_id: result.agentId!,
+          plugin_key: "pi",
+          principal_fingerprint: principalFingerprint(principal),
+          updated_at: new Date().toISOString(),
+        });
+        client.refreshAgentIdentity();
+        // Keep the PRINCIPAL reachable for later control-plane work: an
+        // env-provided key only lives in this process's environment.
+        client.ensurePrincipalCached();
+        provisionedNow = true;
+        logPluginEvent({
+          event: "plugin_agent_provisioned",
+          agent_id: result.agentId,
+          created: true,
+          reason: strict ? "explicit" : "shared_memory",
+        });
+        agentKey = result.apiKey;
+      }
+      if (!agentKey) return;
+
+      let shared = await client.ensureSharedMemory({ dataset: state.dataset, allowSetup: true, timeoutMs: remaining() });
+      if (shared.mode !== "shared" && provisionedNow && cfg.pluginIdentity !== "enabled") {
+        // Under `auto` the agent was provisioned only on the promise that shared
+        // memory keeps the principal's datasets reachable — honour the promise by
+        // staying on the principal (the fresh key is revoked server-side; the
+        // agent user stays for a later, successful migration). `enabled` keeps it.
+        logPluginEvent({ event: "plugin_identity_reverted", reason: shared.reason, detail: "shared memory unavailable" });
+        await client.disconnectPluginAgent(remaining()).catch(() => {});
+        clearAgentKeyRecord();
+        client.dropAgentIdentity();
+        shared = {
+          mode: "separated",
+          reason: shared.reason,
+          dataset_id: "",
+          dataset_ids: [],
+          role_id: "",
+        };
+      }
+      applySharedOutcome(shared);
+    } catch {
+      /* fail-soft — provisioning must never disturb the session */
+    }
+  }
+
+  /** /cognee-doctor Memory line — the reference Memory Sharing strings (§1.6). */
+  function memorySharingLine(): string {
+    try {
+      if (!cfg.sharedAgentMemory) return "separated (opt-out)";
+      const marker = loadSharedMemoryMarker(cfg.baseUrl);
+      if (!client.activeAgentKey) {
+        const reason = String(marker.reason ?? "").replace(/_/g, " ");
+        return reason
+          ? `principal (shared memory unavailable: ${reason})`
+          : "principal (no agent identity)";
+      }
+      if (marker.mode === "shared") return `shared (role: ${AGENT_ROLE_NAME})`;
+      return `separated (${String(marker.reason ?? "not wired yet").replace(/_/g, " ")})`;
+    } catch {
+      return "unavailable";
+    }
+  }
+
+  /** /cognee-doctor Provisioning line (§3.7): capability verdict or opt-out. */
+  async function provisioningDoctorLine(): Promise<string> {
+    if (cfg.pluginIdentity === "disabled") return "disabled (COGNEE_PLUGIN_IDENTITY=false)";
+    const capabilities = await client.probeCapabilities(3000);
+    if (!capabilities.probed) return "not probed (server unreachable)";
+    return capabilities.provisioning
+      ? "supported (create_only advertised)"
+      : "server does not support provisioning";
+  }
+
   /* ----- Health check + background re-probe ----- */
 
   async function runHealthCheck(opts: { notify: boolean }): Promise<HealthResult> {
@@ -517,6 +1099,9 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
         });
       }
       void drainWriteQueue().catch(() => {});
+      // Shared-agent-memory provisioning runs after health resolves — once per
+      // session, bounded, fail-soft (never blocks this probe's caller).
+      void runProvisioningFlow().catch(() => {});
       // Code-graph auto-index: one background attempt per session, only after the
       // server is confirmed healthy (never blocks startup; never fires when down).
       if (!state.autoIndexTried && state.cwd) {
@@ -527,7 +1112,8 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
         }, 100);
         state.timers.add(timer);
       }
-      setStatusSafe(`● cognee: ${cfg.backend} · ${state.dataset}`);
+      state.connState = "ok";
+      renderStatusline();
       if (opts.notify || state.degradedNotified) {
         state.degradedNotified = false;
         notifySafe("Cognee Memory Connected", "info");
@@ -536,8 +1122,12 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
     }
     state.healthy = false;
     state.lastError = result.error ?? "unreachable";
+    state.connState = "offline";
+    // T2 bootstrap trigger: an unreachable local server may be bootable (the
+    // once-guard inside maybeBootstrap makes this cheap after the first time).
+    void maybeBootstrap().catch(() => {});
     // Same information set as the official statusline (health · backend · dataset).
-    setStatusSafe(`✕ cognee: offline (${cfg.backend} · ${state.dataset})`);
+    renderStatusline();
     if (opts.notify && !state.degradedNotified) {
       state.degradedNotified = true;
       notifySafe(
@@ -762,48 +1352,185 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
     };
   }
 
-  /* ----- Session-cache writes (tier 1) with bounded in-memory buffer ----- */
+  /* ----- Session-cache writes (tier 1): memory view over the disk bridge -----
+   *
+   * state.writeQueue stays the in-memory view; the durable bridge file
+   * (<stateDir>/bridge/<sha1(sid)>.json, spec §2.5) is the single source of
+   * truth across restarts. Capture spills straight to the file when the server
+   * is known-unusable (never sent → never ambiguous); otherwise entries ride
+   * memory and spill on the first failed retryable drain attempt. */
 
   function queueQa(entry: QaEntry): void {
+    queueBound({ ...entry, sessionId: state.sessionId, dataset: state.dataset });
+  }
+
+  /** Queue one captured tool-call trace (v0.4) — the same bounded buffer and
+   *  capture-time binding as queueQa: a trace drains into the session+dataset
+   * active when it was captured, never whichever one is active at drain time. */
+  function queueTrace(entry: TraceEntry): void {
+    queueBound({ ...entry, sessionId: state.sessionId, dataset: state.dataset });
+  }
+
+  function queueBound(bound: BoundQaEntry | BoundTraceEntry): void {
+    if (!state.healthy) {
+      // Server-unusable-at-capture: spill immediately with ambiguous:false —
+      // the entry was never sent, so replay can never duplicate it (§2.5).
+      state.droppedCount += appendBridge(bound.sessionId, bound as unknown as SpilledEntry, {
+        ambiguous: false,
+        maxEntries: cfg.bufferLimit,
+      });
+      renderStatusline();
+      return;
+    }
     if (state.writeQueue.length >= cfg.bufferLimit) {
       state.writeQueue.shift();
       state.droppedCount++;
-      // ponytail: drop-oldest silently — bounded memory beats unbounded growth;
-      // the official plugins spill to a disk bridge instead (deferred).
     }
-    state.writeQueue.push({ ...entry, sessionId: state.sessionId, dataset: state.dataset });
+    state.writeQueue.push(bound);
     void drainWriteQueue().catch(() => {});
+  }
+
+  /** The drain's head: the merged view — the bridge FILE first (older, possibly
+   *  pre-crash), then the memory-only tail. The file consulted is the session
+   * owning the current memory head (FIFO per session); when memory is empty,
+   * the active session's file, and finally any other session's oldest spill
+   * (retired/stranded sessions drain under their own binding). Backoff-open
+   * files are skipped. */
+  function mergedHeadEntry(): { entry: PendingEntry; source: "file" | "memory" } | undefined {
+    try {
+      const memSid = state.writeQueue[0]?.sessionId ?? state.sessionId;
+      if (memSid) {
+        const spilled = loadBridge(memSid);
+        if (spilled.length > 0 && !bridgeBackoffOpen(memSid)) {
+          return { entry: spilled[0] as unknown as PendingEntry, source: "file" };
+        }
+      }
+    } catch {
+      /* fail-soft — memory path below */
+    }
+    if (state.writeQueue.length > 0) return { entry: state.writeQueue[0], source: "memory" };
+    try {
+      const own = loadBridge(state.sessionId);
+      if (own.length > 0 && !bridgeBackoffOpen(state.sessionId)) {
+        return { entry: own[0] as unknown as PendingEntry, source: "file" };
+      }
+    } catch {
+      /* fail-soft */
+    }
+    try {
+      const other = oldestPendingBridgeHead(state.sessionId);
+      if (other) return { entry: other.entry as unknown as PendingEntry, source: "file" };
+    } catch {
+      /* fail-soft */
+    }
+    return undefined;
+  }
+
+  /** Spill the whole memory queue on the first failed retryable attempt: the
+   *  failed entry keeps the ambiguity verdict; the never-attempted tail does
+   *  not (§2.5 spill policy). Order is preserved per session file. */
+  function spillMemoryQueue(failedAmbiguous: boolean): void {
+    const spilledCount = state.writeQueue.length;
+    let first = true;
+    for (const bound of state.writeQueue) {
+      state.droppedCount += appendBridge(bound.sessionId, bound as unknown as SpilledEntry, {
+        ambiguous: first && failedAmbiguous,
+        maxEntries: cfg.bufferLimit,
+      });
+      first = false;
+    }
+    state.writeQueue = [];
+    logPluginEvent({ event: "bridge_spilled", count: spilledCount });
   }
 
   async function drainWriteQueue(opts: { force?: boolean; deadline?: number } = {}): Promise<void> {
     if (state.draining || !state.healthy || (!opts.force && state.stopped) || !state.sessionId) return;
     state.draining = true;
+    // Background drains are time-boxed by COGNEE_DRAIN_BUDGET_MS (reference
+    // COGNEE_DRAIN_BUDGET=20 s); a caller's explicit deadline (final sync 4 s) wins.
+    const deadline = opts.deadline ?? Date.now() + cfg.drainBudgetMs;
     try {
-      while (state.writeQueue.length > 0 && state.healthy && (opts.force || !state.stopped)) {
-        if (opts.deadline !== undefined && Date.now() >= opts.deadline) break;
-        const next = state.writeQueue[0];
+      while (state.healthy && (opts.force || !state.stopped)) {
+        if (Date.now() >= deadline) break;
+        const head = mergedHeadEntry();
+        if (!head) break;
+        const next = head.entry;
         // Bound at capture: each entry drains into the session/dataset it was
         // captured under — never whichever one happens to be active at drain time.
-        const { sessionId, dataset, ...entry } = next;
-        // Bounded per-request timeout when a deadline is in force (final sync).
-        const timeoutMs =
-          opts.deadline !== undefined
-            ? Math.max(1000, Math.min(cfg.requestTimeoutMs, opts.deadline - Date.now()))
-            : undefined;
-        const result = await client.rememberEntry(entry, sessionId, dataset, timeoutMs);
+        const { sessionId, dataset, _replay_ambiguous, _buffered_at, ...entry } = next;
+        void _replay_ambiguous;
+        void _buffered_at;
+        // Bounded per-request timeout clamped to the remaining budget.
+        const timeoutMs = Math.max(1000, Math.min(cfg.requestTimeoutMs, deadline - Date.now()));
+        // Verify-before-replay (§2.5): an ambiguous head — QA or trace — is
+        // checked against the server's recent rows; a fingerprint match
+        // consumes the entry WITHOUT re-sending (dedup). Detail failure →
+        // replay (fail-open: a rare duplicate beats a lost turn). Entry kinds
+        // with no fingerprint (session detail never exposes them) replay.
+        if (head.source === "file" && _replay_ambiguous) {
+          const fingerprint = entryFingerprint(entry);
+          const detail = await client.getSessionDetail(sessionId, timeoutMs);
+          if (
+            fingerprint &&
+            detail.ok &&
+            serverFingerprints(detail.qas, detail.traces).has(fingerprint)
+          ) {
+            trimBridgeHead(sessionId, 1);
+            state.dedupedCount++;
+            renderStatusline();
+            continue;
+          }
+        }
+        // Under shared memory the resolved canonical UUID addresses the write
+        // (§3.5): a name only resolves among the CALLER's own datasets.
+        const result = await client.rememberEntry(
+          entry,
+          sessionId,
+          dataset,
+          timeoutMs,
+          datasetIdFor(dataset),
+        );
         if (result.ok) {
-          state.writeQueue.shift();
+          if (head.source === "file") {
+            trimBridgeHead(sessionId, 1);
+            resetBridgeFailures(sessionId);
+          } else {
+            state.writeQueue.shift();
+          }
+          bumpStoredCounter(sessionId);
           state.capturedCount++;
+          renderStatusline();
           continue;
         }
         const err = result.error;
-        // Retriable (network/5xx): keep buffered for the next drain. Permanent 4xx: drop loudly.
-        if (err && ((err.status ?? 0) === 0 || err.status! >= 500)) {
-          state.lastError = err.message;
+        const status = err?.status ?? 0;
+        const retryable = !err || status === 0 || status >= 500;
+        if (retryable) {
+          if (head.source === "memory") {
+            // First failed retryable attempt: spill that entry (plus any queued
+            // behind it) — ambiguity per the §1.5 classification.
+            spillMemoryQueue(writeOutcomeAmbiguous(err));
+          } else {
+            if (writeOutcomeAmbiguous(err)) markBridgeHeadAmbiguous(sessionId);
+            // HTTP-status streak → backoff — but never from a FORCED pass: the
+            // final sync's bounded last-chance retry already leaves the tail
+            // spilled, and stamping backoff would delay the next launch's
+            // replay (§2.3's crash-tolerance promise).
+            if (status > 0 && !opts.force) recordBridgeFailure(sessionId);
+          }
+          state.lastError = err?.message ?? "write failed";
           break;
         }
-        state.writeQueue.shift();
-        state.droppedCount++;
+        // Permanent 4xx: memory entries drop loudly (existing behavior); a
+        // FILE head stays buffered and enters the drain backoff instead — a
+        // poisoned buffered head must not be silently destroyed (reference
+        // parity: 4xx is never buffered at capture, only via a retryable spill).
+        if (head.source === "memory") {
+          state.writeQueue.shift();
+          state.droppedCount++;
+        } else if (!opts.force) {
+          recordBridgeFailure(sessionId);
+        }
         state.lastError = err?.message ?? "write rejected";
       }
     } finally {
@@ -813,47 +1540,152 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
 
   /* ----- Graph promotion (tier 2) ----- */
 
+  /** Short reason token for the persisted failure record (reference caps at 120). */
+  function improveReasonToken(err?: CogneeError): string {
+    if (err?.unreachable) return "unreachable";
+    if (err?.transient || err?.aborted) return "timeout";
+    if ((err?.status ?? 0) > 0) return `HTTP ${err?.status}`;
+    return "error";
+  }
+
+  /** The improve wrapper (spec §2.4): every trigger goes through here so only
+   *  CONFIRMED outcomes stamp the persisted cooldown state — ok/busy record a
+   *  success (busy = the server is already improving this session, goal
+   *  achieved), error/unsupported record a failure with a reason token. */
+  async function submitImprove(
+    trigger: "idle" | "auto" | "final" | "manual" | "switch",
+    opts: { sessionId?: string; dataset?: string; timeoutMs?: number } = {},
+  ): Promise<{ outcome: "ok" | "busy" | "unsupported" | "error"; error?: CogneeError }> {
+    const sessionId = opts.sessionId ?? state.sessionId;
+    const dataset = opts.dataset ?? state.dataset;
+    if (!sessionId || state.improvesInFlight.has(sessionId)) {
+      return { outcome: "error", error: new CogneeError("improve already in flight") };
+    }
+    state.improvesInFlight.add(sessionId);
+    try {
+      logPluginEvent({ event: "improve_submitted", trigger, session_id: sessionId });
+      const result = await client.improve(sessionId, datasetIdFor(dataset) || dataset, opts.timeoutMs);
+      if (result.outcome === "ok" || result.outcome === "busy") {
+        recordImproveSuccess(sessionId, dataset, trigger, readStoredCounter(sessionId));
+        if (sessionId === state.sessionId) state.lastImprovedCount = state.capturedCount;
+      } else {
+        recordImproveFailure(sessionId, dataset, trigger, improveReasonToken(result.error));
+      }
+      return result;
+    } catch (err) {
+      const wrapped = wrapAsCogneeError(err);
+      recordImproveFailure(sessionId, dataset, trigger, improveReasonToken(wrapped));
+      return { outcome: "error", error: wrapped };
+    } finally {
+      state.improvesInFlight.delete(sessionId);
+      renderStatusline();
+    }
+  }
+
   function maybeAutoImprove(): void {
     const every = cfg.autoImproveEvery;
     if (!every || state.capturedCount === 0 || state.stopped) return;
     // Fire when the stored-write counter CROSSES the threshold — capturedCount can
     // jump past a modulo target when several queued entries drain at once.
     if (state.capturedCount - state.lastImprovedCount < every) return;
-    const now = Date.now();
-    if (now - state.lastAutoImproveAt < cfg.improveCooldownMs) return;
-    state.lastAutoImproveAt = now;
+    // The persisted gate replaces the in-memory cooldown timestamp (spec §2.4):
+    // both auto paths (every-N and idle) consult improveThrottleReason(), so a
+    // session improved 10 min ago stays quiet across a relaunch, a failed
+    // improve gets one attempt per window, and a session with nothing new
+    // stored since the last success is skipped.
+    if (improveThrottleReason(state.sessionId, cfg.improveCooldownMs)) return;
     state.lastImprovedCount = state.capturedCount;
-    void client.improve(state.sessionId, state.dataset).catch(() => {
+    void submitImprove("auto").catch(() => {
       /* fail-soft */
     });
+  }
+
+  /* ----- Idle bridge (spec §2.2): agent_settled + one bounded timer -----
+   *
+   * The reference's detached idle watcher maps to an event-driven arm: every
+   * user message / settled turn re-arms ONE timer; when it fires without new
+   * activity, at most one improve attempt runs (the analog of "one attempt per
+   * watcher life, next prompt respawns"). A throttled fire re-arms exactly
+   * once at the persisted cooldown's expiry — a quiet stretch that outlasts
+   * the cooldown still gets exactly one bridge, without a poll loop. */
+
+  function armIdleBridge(): void {
+    try {
+      if (!cfg.idleImprove || !cfg.capture || state.stopped || !state.sessionId) return;
+      if (state.idleTimer) {
+        clearTimeout(state.idleTimer);
+        state.timers.delete(state.idleTimer);
+        state.idleTimer = undefined;
+      }
+      const timer = setTimeout(() => {
+        state.idleTimer = undefined;
+        state.timers.delete(timer);
+        void fireIdleBridge(false).catch(() => {});
+      }, cfg.idleThresholdMs);
+      state.idleTimer = timer;
+      state.timers.add(timer);
+    } catch {
+      /* fail-soft */
+    }
+  }
+
+  async function fireIdleBridge(rearmed: boolean): Promise<void> {
+    try {
+      if (!cfg.capture || state.stopped || !state.sessionId) return;
+      const reason = improveThrottleReason(state.sessionId, cfg.improveCooldownMs);
+      if (reason === "") {
+        void submitImprove("idle").catch(() => {});
+        return;
+      }
+      if (reason === "cooldown" || reason === "backoff") {
+        if (rearmed) return; // one re-arm per arm — next activity re-arms fresh
+        const st = readImproveState(state.sessionId);
+        const anchor = Number(reason === "cooldown" ? st.last_improved_at : st.last_failed_at) || 0;
+        const delay = Math.max(0, anchor + cfg.improveCooldownMs - Date.now());
+        logPluginEvent({ event: "improve_throttled", reason, rearm_ms: delay });
+        const timer = setTimeout(() => {
+          state.idleTimer = undefined;
+          state.timers.delete(timer);
+          void fireIdleBridge(true).catch(() => {});
+        }, delay);
+        state.idleTimer = timer;
+        state.timers.add(timer);
+        return;
+      }
+      // "no_new_entries" → do nothing: the next stored write re-arms via agent_settled.
+    } catch {
+      /* fail-soft */
+    }
   }
 
   async function finalSync(): Promise<void> {
     if (state.finalSyncDone) return;
     state.finalSyncDone = true;
     if (!cfg.finalSync || !state.sessionId) return;
-    // ponytail: bounded in-process final sync instead of the official detached
-    // retrying worker — a slow server must not stall pi's shutdown. One late
-    // health re-probe gives a server that came back during the session a final
-    // chance to receive the buffered writes before the graph promote; anything
-    // still buffered when pi exits is lost (no disk bridge yet).
+    // Bounded in-process final sync (spec §2.3): the exit-watcher's detached
+    // worker maps to crash tolerance via the bridge — anything this 4 s pass
+    // cannot flush stays in the spill file and replays at the next launch.
     try {
-      if (state.writeQueue.length > 0 && !state.healthy) {
+      if (pendingWriteCount() > 0 && !state.healthy) {
         state.healthy = (await client.health(1000)).reachable;
       }
       if (state.healthy) {
         await drainWriteQueue({ force: true, deadline: Date.now() + FINAL_SYNC_TIMEOUT_MS });
       }
       if (state.capturedCount > 0) {
-        await client.improve(state.sessionId, state.dataset, FINAL_SYNC_TIMEOUT_MS);
+        await submitImprove("final", { timeoutMs: FINAL_SYNC_TIMEOUT_MS });
       }
       // Sessions retired by a --force switch past a failed sync get their own
       // promotion pass: their buffered writes were bound at capture time and
-      // drained above, so only the graph promote remains (our analog of the
-      // reference's `touched` retry).
+      // drained above (or stayed spilled under their own binding), so the graph
+      // promote remains (our analog of the reference's `touched` retry).
       for (const retired of state.retiredSessions) {
         try {
-          await client.improve(retired.sessionId, retired.dataset, FINAL_SYNC_TIMEOUT_MS);
+          await submitImprove("final", {
+            sessionId: retired.sessionId,
+            dataset: retired.dataset,
+            timeoutMs: FINAL_SYNC_TIMEOUT_MS,
+          });
         } catch {
           /* fail-soft per retired session */
         }
@@ -867,6 +1699,10 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
     state.stopped = true;
     for (const timer of state.timers) clearTimeout(timer);
     state.timers.clear();
+    if (state.idleTimer) {
+      clearTimeout(state.idleTimer);
+      state.idleTimer = undefined;
+    }
     if (state.codeReindexTimer) {
       clearTimeout(state.codeReindexTimer);
       state.codeReindexTimer = undefined;
@@ -909,22 +1745,22 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           return "pipeline FAILED — data stored, but graph build failed";
         }
       }
-      // Abort-aware poll sleep, registered in state.timers so shutdown clears it.
+      // Abort-aware poll sleep, registered in state.timers so shutdown clears
+      // it. The abort listener is named and removed on the normal timeout path
+      // so poll iterations never accumulate listeners on the same signal.
       await new Promise<void>((resolve) => {
+        const onAbort = () => {
+          clearTimeout(t);
+          state.timers.delete(t);
+          resolve();
+        };
         const t = setTimeout(() => {
+          signal?.removeEventListener("abort", onAbort);
           state.timers.delete(t);
           resolve();
         }, intervalMs);
         state.timers.add(t);
-        signal?.addEventListener(
-          "abort",
-          () => {
-            clearTimeout(t);
-            state.timers.delete(t);
-            resolve();
-          },
-          { once: true },
-        );
+        signal?.addEventListener("abort", onAbort, { once: true });
       });
     }
     return "still processing in background";
@@ -1114,6 +1950,7 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           query: params.query,
           sessionId: state.sessionId || undefined,
           dataset: state.dataset,
+          datasetIds: sharedReadIds(),
           topK: params.top_k ?? 5,
           searchType: params.search_type ?? "HYBRID_COMPLETION",
           onlyContext: true,
@@ -1159,10 +1996,14 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
     }),
     async execute(_toolCallId, params, signal) {
       try {
+        const dataset = params.dataset ?? state.dataset;
         const result = await client.recall({
           query: params.query,
           topK: params.top_k ?? 5,
-          dataset: params.dataset ?? state.dataset,
+          dataset,
+          // An explicit dataset argument targets that dataset by name; the
+          // shared-memory read set applies only to the session dataset.
+          datasetIds: params.dataset ? undefined : sharedReadIds(),
           searchType: params.search_type, // undefined → server default routing (explicit-search parity)
           onlyContext: true,
           scope: ["graph"],
@@ -1383,20 +2224,20 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
     }),
     async execute(_toolCallId, params, signal) {
       try {
-        const result = await client.improve(
-          state.sessionId || "unknown",
-          params.dataset ?? state.dataset,
-          cfg.improveSubmitTimeoutMs,
-          signal,
-        );
+        const target = params.dataset ?? state.dataset;
+        const { outcome, error } = await submitImprove("manual", {
+          dataset: target,
+          timeoutMs: cfg.improveSubmitTimeoutMs,
+        });
+        void signal;
         const messages: Record<string, string> = {
-          ok: `Session cache promoted into the graph (dataset '${params.dataset ?? state.dataset}').`,
+          ok: `Session cache promoted into the graph (dataset '${target}').`,
           busy: "The server is already improving this session — it will sync on its own; nothing to do.",
           unsupported:
             "This cognee server does not support /api/v1/improve (older than the plugin-pinned version) — session not synced.",
         };
-        if (result.outcome === "error") return errResult("cognee_sync failed", result.error);
-        return textResult(messages[result.outcome], { outcome: result.outcome });
+        if (outcome === "error") return errResult("cognee_sync failed", error);
+        return textResult(messages[outcome], { outcome });
       } catch (err) {
         return errResult("cognee_sync failed", wrapAsCogneeError(err));
       }
@@ -1424,7 +2265,7 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           `  API key:   ${client.authSummary()}`,
           `  Auto:      capture ${cfg.capture ? "on" : "off (COGNEE_CAPTURE=false)"} · auto-recall ${cfg.capture ? "on" : "off"} · auto-sync every ${cfg.autoImproveEvery || "∞"} writes`,
           `  Recall:    ${state.turnsWithHits}/${state.totalRecallTurns} turns had hits this session`,
-          `  Queue:     ${state.writeQueue.length} buffered · ${state.capturedCount} stored this session${state.droppedCount ? ` · ${state.droppedCount} dropped` : ""}`,
+          `  Queue:     ${state.writeQueue.length} buffered · ${loadBridge(state.sessionId).length} spilled · ${state.capturedCount} stored this session${state.droppedCount ? ` · ${state.droppedCount} dropped` : ""}${state.dedupedCount ? ` · ${state.dedupedCount} deduped` : ""}${cfg.idleImprove ? ` · idle sync every ${Math.round(cfg.idleThresholdMs / 1000)}s quiet` : " · idle sync off (COGNEE_IDLE_IMPROVE=false)"}`,
           `  Breaker:   ${breakerOpen() ? `open until ${new Date(state.breakerOpenUntil).toLocaleTimeString()} (recall paused)` : "closed"} · file-shared (${sharedBreakerSummary()})`,
           codeGraphStatusLine(),
         ];
@@ -1456,17 +2297,30 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           `  ${pad("LLM_API_KEY")}${cfg.llmApiKeyConfigured ? `configured${cfg.llmModel ? ` (model ${cfg.llmModel})` : ""} — required by a local cognee server` : "missing — required in local mode (the server, not this extension, needs it)"}`,
           `  ${pad("Dataset")}${state.dataset} — ${datasetSourceLabel()}`,
           `  ${pad("Federation")}${federationStatusLine()}`,
+          `  ${pad("Memory")}${memorySharingLine()}`,
+          `  ${pad("Provisioning")}${await provisioningDoctorLine()}`,
           `  ${pad("Session")}${state.sessionId || "(not started)"}`,
           `  ${pad("Datasets")}${datasets.ok && datasets.datasets.length ? datasets.datasets.slice(0, 10).map((d) => `${d.name}${d.id ? ` (${d.id.slice(0, 8)}…)` : ""}`).join(", ") : datasets.ok ? "(none readable)" : `unavailable (${describeError(datasets.error)})`}`,
-          `  ${pad("Capture")}${cfg.capture ? "on" : "off (COGNEE_CAPTURE=false)"} · stored this session: ${state.capturedCount} · buffered: ${state.writeQueue.length}`,
+          `  ${pad("Capture")}${cfg.capture ? "on" : "off (COGNEE_CAPTURE=false)"} · stored this session: ${state.capturedCount} · buffered: ${state.writeQueue.length} · spilled: ${loadBridge(state.sessionId).length}${state.dedupedCount ? ` · deduped: ${state.dedupedCount}` : ""}`,
+          `  ${pad("Capture pol")}${capturePolicySummary()}`,
           `  ${pad("Breaker")}${breakerOpen() ? `OPEN until ${new Date(state.breakerOpenUntil).toLocaleTimeString()}` : `closed (${state.failureTimestamps.length}/${cfg.breakerThreshold} recent failures)`} · shared: ${sharedBreakerSummary()}`,
           `  ${pad("Timeouts")}recall ${cfg.recallTimeoutMs}ms · request ${cfg.requestTimeoutMs}ms · health ${cfg.healthTimeoutMs}ms`,
           `  ${pad("Code graph")}${codeGraphStatusLine()}`,
+          `  ${pad("Local runtime")}uv: ${findUv() || "not found"} · venv: ${await localRuntimeVersion()} · pin: ${PINNED_COGNEE_VERSION}${cfg.localBootstrap ? bootstrapStateSuffix() : " · bootstrap off (COGNEE_LOCAL_BOOTSTRAP=off)"}`,
+          `  ${pad("Server pidfile")}${serverPidfileStatus(serverPort(cfg.baseUrl))}`,
         ];
         if (cfg.backend === "local" && keySummary.startsWith("not set")) {
           lines.push(
             `             cognee ≥1.2.2 enforces auth even on localhost — pi-cognee auto-mints an owner key when the server's default user can log in: start it with DEFAULT_USER_PASSWORD set to the same value as COGNEE_USER_PASSWORD (defaults: default_user@example.com / default_password), or set COGNEE_API_KEY explicitly.`,
           );
+        }
+        if (cfg.pluginIdentityError) {
+          lines.push(
+            `             ✕ ${cfg.pluginIdentityError} — identity behaves as auto (fail-soft).`,
+          );
+        }
+        if (client.identityProblem) {
+          lines.push(`             ✕ ${client.identityProblem}`);
         }
         report(ctx, lines.join("\n"), health.reachable ? "info" : "warning");
       } catch (err) {
@@ -1569,6 +2423,7 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           query,
           topK,
           dataset: dataset ?? state.dataset,
+          datasetIds: dataset ? undefined : sharedReadIds(),
           onlyContext: true,
           scope: ["graph"],
           timeoutMs: cfg.requestTimeoutMs,
@@ -1764,17 +2619,19 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           report(ctx, "No session yet — nothing to sync.", "warning");
           return;
         }
-        const result = await client.improve(state.sessionId, state.dataset, cfg.improveSubmitTimeoutMs);
-        if (result.outcome === "ok") {
-          state.lastAutoImproveAt = Date.now();
-          state.lastImprovedCount = state.capturedCount;
+        // Manual sync is ungated by the cooldown (parity) but still records its
+        // confirmed outcome through the wrapper (spec §2.4).
+        const { outcome, error } = await submitImprove("manual", {
+          timeoutMs: cfg.improveSubmitTimeoutMs,
+        });
+        if (outcome === "ok") {
           report(ctx, `Session cache promoted into the graph (dataset '${state.dataset}').`);
-        } else if (result.outcome === "busy") {
+        } else if (outcome === "busy") {
           report(ctx, "The server is already improving this session — nothing to do.", "warning");
-        } else if (result.outcome === "unsupported") {
+        } else if (outcome === "unsupported") {
           report(ctx, "This server does not support /api/v1/improve — session not synced.", "warning");
         } else {
-          report(ctx, `Sync failed: ${result.error?.message ?? "unknown error"}`, "error");
+          report(ctx, `Sync failed: ${error?.message ?? "unknown error"}`, "error");
         }
       } catch (err) {
         report(ctx, `Sync failed: ${describeError(err)}`, "error");
@@ -1802,6 +2659,18 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           return;
         }
         const target = positional[0] ?? "";
+        // Re-read the identity cache (the reference's resolve_shared_dataset
+        // loads it itself): another process may have provisioned since we were
+        // constructed, and the shared-resolution path below depends on it.
+        client.refreshAgentIdentity();
+        // Opt-out (COGNEE_SHARED_AGENT_MEMORY=false with a live shared marker):
+        // the agent leaves the shared role as the principal and the marker is
+        // demoted keeping the tenant/role/parent ids (re-enabling rejoins).
+        // No-op when unwired/unsupported (§3.6). Runs once per command — cheap
+        // after the first demotion (the marker is no longer shared).
+        if (!cfg.sharedAgentMemory && client.activeAgentKey) {
+          await client.ensureSharedMemory({ allowSetup: false, timeoutMs: 8000 }).catch(() => {});
+        }
         const listed = await client.listDatasets();
         if (!listed.ok) {
           report(
@@ -1814,14 +2683,42 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           );
           return;
         }
+        // Writability narrowing (v0.4, §3.6): when the permissions route answers
+        // (probe once per command), narrow the listing to writable rows and print
+        // the reference's notes. Route absent/unreachable → today's every-readable
+        // heuristic, and say so — pi's fail-soft divergence from the reference's
+        // refusal of unverifiable targets.
+        let writableListing: Awaited<ReturnType<CogneeClient["listWritableDatasets"]>> | undefined;
+        try {
+          writableListing = await client.listWritableDatasets(5000);
+        } catch {
+          /* permissions route absent — permissive fallback below */
+        }
         if (!target) {
-          report(ctx, renderDatasetList(state.dataset, state.sessionId, listed.datasets));
+          const extra: string[] = [];
+          if (writableListing) {
+            if (writableListing.hidden_readonly > 0) {
+              extra.push(`(${writableListing.hidden_readonly} read-only dataset(s) not shown)`);
+            }
+            if (!writableListing.filtered) {
+              extra.push("(write access could not be verified — showing every readable dataset)");
+            }
+          }
+          report(
+            ctx,
+            renderDatasetList(
+              state.dataset,
+              state.sessionId,
+              writableListing ? writableListing.datasets : listed.datasets,
+              extra,
+            ),
+          );
           return;
         }
         // A Cognee session never spans two datasets: switching means syncing the
         // session being left, minting a NEW session id for the target dataset,
         // and repointing every lane (mirror of the reference switch-dataset flow,
-        // minus the agent-registry conn handles — accepted gap #4).
+        // minus the agent-registry conn handles — accepted gap #3 divergence).
         if (target === state.dataset) {
           report(
             ctx,
@@ -1829,7 +2726,7 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           );
           return;
         }
-        const match = matchDatasets(target, listed.datasets);
+        const match = matchDatasets(target, writableListing ? writableListing.datasets : listed.datasets);
         if (match.status === "ambiguous") {
           report(
             ctx,
@@ -1839,11 +2736,27 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           );
           return;
         }
+        // Read-only / unresolvable-UUID targets are refused up front when the
+        // permissions route positively judged writability (reference exit-5). In
+        // unverified mode (no route) the heuristic stays permissive.
+        if (writableListing?.filtered) {
+          const matched = match.status === "ok";
+          if ((!matched && writableListing.readonly.includes(target)) || (isUuid(target) && !matched)) {
+            report(
+              ctx,
+              `Dataset '${target}' is not writable — pick a writable dataset from the list: /cognee-datasets`,
+              "error",
+            );
+            return;
+          }
+        }
+        // Under a live shared marker the target is resolved AS THE PARENT later
+        // (canonical UUID + grant backfill, create-as-parent when absent);
+        // otherwise an unlisted name is CREATED on switch (the picker's
+        // free-typed "Other") for the effective identity by name.
+        const sharedLive = cfg.sharedAgentMemory && Boolean(client.activeAgentKey);
         let datasetName = match.status === "ok" ? match.matches[0].name || target : target;
-        if (match.status === "missing") {
-          // An unlisted name is CREATED on switch (the picker's free-typed "Other").
-          // Divergence vs the reference: single principal — every readable dataset
-          // is owned, hence writable; there is no permissions route to consult yet.
+        if (match.status === "missing" && !sharedLive) {
           const ensured = await client.ensureDataset(target);
           if (!ensured.ok) {
             report(
@@ -1865,11 +2778,13 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
         let syncError = "";
         if (state.sessionId) {
           try {
-            if (state.writeQueue.length > 0) {
+            if (pendingWriteCount() > 0) {
               await drainWriteQueue({ force: true, deadline: Date.now() + FINAL_SYNC_TIMEOUT_MS });
             }
             if (state.capturedCount > 0) {
-              const improved = await client.improve(state.sessionId, state.dataset, FINAL_SYNC_TIMEOUT_MS);
+              // Switch sync is ungated by the cooldown (parity); the confirmed
+              // outcome still lands in the persisted state via the wrapper.
+              const improved = await submitImprove("switch", { timeoutMs: FINAL_SYNC_TIMEOUT_MS });
               if (improved.outcome === "error") {
                 synced = false;
                 syncError = improved.error?.message ?? "improve failed";
@@ -1893,6 +2808,28 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           return;
         }
 
+        // 1b. Resolve the target under shared memory (reference _ensure_dataset):
+        //     the canonical parent-owned UUID every agent writes to, granted to
+        //     the shared role — created as the PARENT when absent. Failure on an
+        //     unlisted target aborts (nothing was created for us); on a listed
+        //     target the switch proceeds name-addressed (wiring retried later).
+        let writeId = "";
+        let readIds: string[] = [];
+        if (sharedLive) {
+          const shared = await client.resolveSharedDataset(datasetName, 8000);
+          if (shared.mode === "shared" && shared.dataset_id) {
+            writeId = shared.dataset_id;
+            readIds = shared.dataset_ids;
+          } else if (match.status === "missing") {
+            report(
+              ctx,
+              `Cannot switch to '${target}': shared-memory resolution failed (${shared.reason.replace(/_/g, " ")}) — pick from the list: /cognee-datasets`,
+              "error",
+            );
+            return;
+          }
+        }
+
         // 2. Mint the next ordinal session id (never collides, stays readable).
         const newSessionId = sanitizeSessionId(
           mintSwitchSessionId(state.sessionId || `${cfg.sessionPrefix}_${randomId()}`),
@@ -1902,20 +2839,28 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
         const prevEnsured = state.datasetEnsured;
         const prevSwitchFrom = state.datasetSwitchedFrom;
         const prevSwitchAt = state.datasetSwitchedAt;
+        const prevSharedDatasetId = state.sharedDatasetId;
+        const prevSharedDatasetIds = state.sharedDatasetIds;
         state.dataset = datasetName;
         state.sessionId = newSessionId;
         state.datasetEnsured = false;
         state.datasetSource = "persisted switch";
         state.datasetSwitchedFrom = previous.dataset;
         state.datasetSwitchedAt = new Date().toISOString();
+        state.sharedDatasetId = writeId;
+        state.sharedDatasetIds = readIds.length ? readIds : writeId ? [writeId] : [];
 
         // 4. … persist atomically (tmp + rename), then read back and verify —
         //    mismatch rolls back: "switch was not persisted; nothing was changed".
+        //    The record carries the shared-memory UUIDs when wiring resolved
+        //    them (empty → name addressing, the pre-v0.4 behavior).
         const record: ActiveDatasetRecord = {
           base_url: cfg.baseUrl,
           key_fp: client.keyFingerprint(),
           dataset: datasetName,
           session_id: newSessionId,
+          dataset_id: writeId,
+          dataset_ids: readIds,
           previous,
           switched_at: state.datasetSwitchedAt,
         };
@@ -1930,6 +2875,8 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           state.datasetSource = cfg.datasetSource;
           state.datasetSwitchedFrom = prevSwitchFrom;
           state.datasetSwitchedAt = prevSwitchAt;
+          state.sharedDatasetId = prevSharedDatasetId;
+          state.sharedDatasetIds = prevSharedDatasetIds;
           report(
             ctx,
             `Switch was not persisted${saved.error ? ` (${saved.error})` : ""} — nothing was changed; the previous session remains active.`,
@@ -1950,7 +2897,7 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
 
         // 5. Lanes re-pointed (capture/recall/sync/statusline read state.dataset);
         //    the code lane and federation stay independent of the session dataset.
-        setStatusSafe(`● cognee: ${cfg.backend} · ${state.dataset}`);
+        renderStatusline();
         void runHealthCheck({ notify: false }).catch(() => {}); // ensure + refresh state
         report(
           ctx,
@@ -2112,12 +3059,40 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
       if (cfg.readDatasetIdsError) {
         notifySafe(`Cognee federation disabled: ${cfg.readDatasetIdsError}`, "warning");
       }
+      // Same surface for a malformed COGNEE_PLUGIN_IDENTITY (behaves as auto).
+      if (cfg.pluginIdentityError) {
+        notifySafe(`Cognee plugin identity: ${cfg.pluginIdentityError} (behaving as auto)`, "warning");
+      }
+      state.provisioningDone = false; // one shared-memory provisioning pass per session
+      // Disk bridge (spec §2.5): sweep files older than 7 d (bounded disk), then
+      // surface this session's spill — the entries stay FILE-resident and the
+      // drain's file-first merged view replays them in order once the post-health
+      // drain fires, BEFORE any new capture lands (new captures append after;
+      // FIFO holds because the drain is strictly head-first). This is the
+      // crash-tolerance replacement for the reference's detached final-sync worker.
+      try {
+        sweepOldBridgeFiles();
+        const spilled = loadBridge(state.sessionId);
+        if (spilled.length > 0) {
+          logPluginEvent({ event: "bridge_loaded", session_id: state.sessionId, count: spilled.length });
+          renderStatusline(); // · N awaiting replay from the durable count
+        }
+      } catch {
+        /* fail-soft — a missed replay just waits for the next drain */
+      }
       // Background health check — startup is never blocked by the server.
+      // T1 bootstrap trigger runs first (fast when the server is present:
+      // a ~2.5s presence verdict; the cold-install path keeps the "◐ starting"
+      // status up until the health check takes over).
       const timer = setTimeout(() => {
         state.timers.delete(timer);
-        void runHealthCheck({ notify: true })
+        void maybeBootstrap()
           .catch(() => {})
-          .finally(() => scheduleReprobe());
+          .finally(() => {
+            void runHealthCheck({ notify: true })
+              .catch(() => {})
+              .finally(() => scheduleReprobe());
+          });
       }, 0);
       state.timers.add(timer);
       void event; // reason unused; every start reason gets the same wiring
@@ -2135,9 +3110,7 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
   }
 
   function recallSkipped(reason: string): BeforeAgentStartEventResult {
-    const buffered = state.writeQueue.length
-      ? ` · ${state.writeQueue.length} awaiting replay`
-      : "";
+    const buffered = pendingWriteCount() ? ` · ${pendingWriteCount()} awaiting replay` : "";
     return {
       message: {
         customType: "cognee_memory",
@@ -2169,6 +3142,10 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           query: redactSecrets(prompt),
           sessionId: state.sessionId,
           dataset: state.dataset,
+          // Precedence #2 after env federation (§3.5): the shared-memory read set
+          // addresses the recall by UUID — the client drops the session binding
+          // exactly as the federation lane already does.
+          datasetIds: sharedReadIds(),
           topK: 5,
           searchType: "HYBRID_COMPLETION",
           onlyContext: true,
@@ -2203,11 +3180,12 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
       if (!result.ok) {
         recordFailure(result.error);
         if (result.error?.status === 401 || result.error?.status === 403) {
-          setStatusSafe(`✕ cognee: auth failed (${cfg.backend} · ${state.dataset})`);
+          state.connState = "auth";
         } else if (result.error && !result.error.transient && result.error.status !== 0) {
           state.healthy = false;
-          setStatusSafe(`✕ cognee: server error (${cfg.backend} · ${state.dataset})`);
+          state.connState = "server-error";
         }
+        renderStatusline();
         const skipped = recallSkipped(recallSkipReason(result.error)); // turn proceeds normally
         if (codeSection && skipped.message && typeof skipped.message.content === "string") {
           skipped.message.content += `\n\n${codeSection}`;
@@ -2215,10 +3193,22 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
         return skipped;
       }
       recordSuccess();
+      // A successful recall is positive connection evidence — it restores the
+      // glyph (the fail verdicts are recall-path observations, §2.1).
+      if (state.connState !== "ok") state.connState = "ok";
+      // Recall-segment counters (spec §2.1): the per-turn hit number sums every
+      // scope that returned something and was injected — graph items + code
+      // facts (exactly the reference's turns_with_hits rule), feeding the
+      // statusline's compact same-numbers view.
+      const turnHits = result.items.length + codeFacts.length;
+      state.lastRecallHits = turnHits;
+      state.lastGraphHits = result.items.length;
+      state.lastCodeHits = codeFacts.length;
+      if (turnHits > 0) state.turnsWithHits++;
+      renderStatusline();
       if (result.noGraph && !codeSection) return; // authoritative empty — nothing built yet
       if (result.items.length > 0 || codeSection) {
-        if (result.items.length > 0) state.turnsWithHits++;
-        const statsLine = `Cognee memory: ${result.items.length} memory hits · ${state.turnsWithHits}/${state.totalRecallTurns} turns had hits this session`;
+        const statsLine = `Cognee memory: ${turnHits} memory hits · ${state.turnsWithHits}/${state.totalRecallTurns} turns had hits this session`;
         const block = renderContextBlock(result.items, cfg.contextMaxChars, statsLine);
         // Reference order: the code section renders FIRST, before the memory block.
         const content = [codeSection, block].filter(Boolean).join("\n\n");
@@ -2245,6 +3235,9 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
             state.pendingQuestion = null;
           }
         }
+        // New user activity resets the idle window (spec §2.2 — the timer IS
+        // the touch; no activity.ts file, no pidfile, no respawn).
+        armIdleBridge();
       } else if (message.role === "assistant") {
         const text = extractText(message.content).trim();
         if (text) {
@@ -2271,11 +3264,60 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
         });
       }
       maybeAutoImprove();
+      // Idle bridge: one arm per quiet gap (spec §2.2) — the timer fires at most
+      // one improve attempt; the next user activity re-arms.
+      armIdleBridge();
       // Code-graph freshness: a turn may have changed the working tree — check
       // (debounced, off the turn's critical path) and re-index in the background.
       scheduleChangeCheck();
     } catch {
       /* fail-soft */
+    }
+  });
+
+  /* ----- Tool-call trace capture (v0.4) — the PostToolUse equivalent -----
+   *
+   * Every ALLOWED tool result becomes a TraceEntry in the session cache
+   * (research/v04-traces-spec.md): master switch → self-reference skip (hard,
+   * before the allowlist — the reference's plugin-CLI rule) → allowlist +
+   * sensitive-path deny (entry-level refusal) → redact input/output → truncate
+   * → queue. Pure observer: returns void, never mutates the event; sibling
+   * tool calls from one assistant message run in parallel, so each event is
+   * self-contained (the input travels with the result — capture only ever
+   * happens from tool_result, never tool_call). */
+  pi.on("tool_result", (event): void => {
+    try {
+      if (!cfg.capture || state.stopped || !state.sessionId) return;
+      const toolName = String(event.toolName ?? "");
+      // Self-reference skip: this extension's own registered tools, and shell
+      // lines mentioning "cognee" (the plugin CLI talking to itself — it would
+      // recurse), never feed the graph — even when the allowlist admits them.
+      if (toolName.startsWith("cognee_")) return;
+      const input = event.input ?? {};
+      if (
+        (toolName === "bash" || toolName === "powershell") &&
+        typeof input.command === "string" &&
+        input.command.includes("cognee")
+      ) {
+        return;
+      }
+      const entry = buildTraceEntry(
+        {
+          toolName,
+          input,
+          content: event.content,
+          isError: Boolean(event.isError),
+        },
+        {
+          allowTools: cfg.captureTools,
+          denyPaths: cfg.captureDenyPaths,
+          redact: cfg.captureRedact,
+          redactPatterns: cfg.captureRedactPatterns,
+        },
+      );
+      if (entry) queueTrace(entry); // allowlist/deny refusal drops silently (reference parity)
+    } catch {
+      /* fail-soft — capture must never disturb the tool path */
     }
   });
 
@@ -2343,6 +3385,7 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
           query: anchorQueryWords(seedText),
           sessionId: state.sessionId,
           dataset: state.dataset,
+          datasetIds: sharedReadIds(),
           topK: 3,
           searchType: "HYBRID_COMPLETION",
           onlyContext: true,
