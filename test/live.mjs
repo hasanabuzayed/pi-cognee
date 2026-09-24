@@ -308,7 +308,11 @@ await step("4c. graph tier: recall() over " + SELFTEST_DS + " finds the fact", a
     dataset: SELFTEST_DS,
     topK: 5,
     onlyContext: true,
-    scope: ["graph"], // explicit-search parity: no search_type pin
+    scope: ["graph"], // production parity: the extension + official plugins pin
+    // HYBRID_COMPLETION on completion recalls; leaving search_type unset lets the
+    // server auto-router pick, which on cognee 1.6.0 returns a scoped completion
+    // that may not echo the fact — not a path any client uses.
+    searchType: "HYBRID_COMPLETION",
     timeoutMs: 20_000,
   });
   if (!rec.ok) {

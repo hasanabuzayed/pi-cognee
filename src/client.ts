@@ -583,7 +583,8 @@ export interface CodeRepoState {
   last_error?: string;
 }
 
-const CODE_STATE_DIR = join(homedir(), ".cognee-plugin", "pi", "code-graph");
+const CODE_STATE_DIR =
+  process.env.COGNEE_CODE_STATE_DIR ?? join(homedir(), ".cognee-plugin", "pi", "code-graph");
 
 function repoStatePath(key: string): string {
   const canonical = canonicalRepoSpec(key);

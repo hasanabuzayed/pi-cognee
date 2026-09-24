@@ -12,6 +12,13 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+// Hermetic per-repo state dir (missing by design — exercises the fail-soft path)
+// BEFORE the client module loads; the real ~/.cognee-plugin state stays untouched.
+process.env.COGNEE_CODE_STATE_DIR ??= path.join(
+  import.meta.dirname ?? ".",
+  `.smoke-state-${process.pid}`,
+);
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
 

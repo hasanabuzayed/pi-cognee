@@ -1035,7 +1035,7 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
         Type.Array(Type.String(), { description: "impact_analysis: symbols whose dependents you want." }),
       ),
       kind: Type.Optional(
-        Type.String({ description: "query_facts: filter by node kind, e.g. 'route' for API endpoints." }),
+        Type.String({ description: "query_facts: filter by node kind — one of: association, dependency, extraction, file_ref, insight, intent, lint, module, route, service, storage, symbol, test_ref (e.g. 'route' for API endpoints, 'symbol' for functions/classes)." }),
       ),
       limit: Type.Optional(Type.Number({ minimum: 1, maximum: 200, description: "query_facts: max facts. Default 50." })),
       max_depth: Type.Optional(Type.Number({ minimum: 1, maximum: 10, description: "explore/traverse: edge hops." })),

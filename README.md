@@ -303,6 +303,7 @@ passes through `LLM_API_KEY` / `LLM_MODEL` for a local server (reported by `/cog
 | `COGNEE_BUFFER_LIMIT` | `100` | In-memory write buffer size while server is down |
 | `COGNEE_BREAKER_THRESHOLD/WINDOW_MS/COOLDOWN_MS` | `5` / `300000` / `120000` | Circuit breaker (only unreachable/5xx count) |
 | `COGNEE_BREAKER_FILE` | `~/.cognee-plugin/pi/breaker.json` | Cross-process breaker state file (open-until + consecutive-failure count, keyed by server URL) |
+| `COGNEE_CODE_STATE_DIR` | `~/.cognee-plugin/pi/code-graph/` | Per-repo index-state directory (dataset + fingerprint + last status; override for tests) |
 | `COGNEE_CODE_AUTOINDEX` | `auto` | Code-graph auto-indexing of new repos: `auto` (loopback server only), `always` (any server), `off`. `COGNEE_CAPTURE=false` disables it as part of all automation |
 | `COGNEE_CODE_INDEX_TIMEOUT_MS` | `120000` | Repo-index submit timeout (background pipelines confirm slowly; a timeout is not retried blindly — the submission may have landed) |
 
