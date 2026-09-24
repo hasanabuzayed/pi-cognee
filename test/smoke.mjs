@@ -24,6 +24,9 @@ process.env.COGNEE_CODE_STATE_DIR ??= smokeStateRoot;
 // cross-process breaker file must not import a real outage into the lane test.
 process.env.COGNEE_PI_STATE_DIR ??= path.join(smokeStateRoot, "pi-state");
 process.env.COGNEE_BREAKER_FILE ??= path.join(smokeStateRoot, "breaker.json");
+// Never let the suite's owner-key mint touch the REAL shared cache
+// (~/.cognee-plugin/api_key.json is parity-shared with the official plugins)
+process.env.COGNEE_API_KEY_CACHE ??= path.join(smokeStateRoot, "api-key.json");
 // v0.4 bootstrap must never fire from the checks below (a real uv on PATH + a
 // real ~/.cognee-plugin would break hermeticity): the bootstrap section at the
 // bottom re-enables it per-test with scrubbed PATH + temp state roots.

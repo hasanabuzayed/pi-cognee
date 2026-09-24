@@ -133,8 +133,8 @@ export function loadCogneeEnvFile(): EnvFileResult {
 /* Shared with the Claude Code / Codex cognee plugins.                  */
 /* ------------------------------------------------------------------ */
 
-const API_KEY_CACHE_DIR = join(homedir(), ".cognee-plugin");
-const API_KEY_CACHE_PATH = join(API_KEY_CACHE_DIR, "api_key.json");
+const API_KEY_CACHE_PATH =
+  process.env.COGNEE_API_KEY_CACHE ?? join(homedir(), ".cognee-plugin", "api_key.json");
 
 /** Cached key file format — identical to the official plugins' save_cached_api_key. */
 interface CachedApiKeyFile {
@@ -158,7 +158,7 @@ function loadCachedApiKey(baseUrl: string): string | undefined {
 
 function saveCachedApiKey(baseUrl: string, key: string): void {
   try {
-    mkdirSync(API_KEY_CACHE_DIR, { recursive: true });
+    mkdirSync(dirname(API_KEY_CACHE_PATH), { recursive: true });
     writeFileSync(
       API_KEY_CACHE_PATH,
       JSON.stringify({ base_url: baseUrl, api_key: key, updated_at: new Date().toISOString() }, null, 2) + "\n",

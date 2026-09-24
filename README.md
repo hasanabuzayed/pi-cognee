@@ -406,6 +406,7 @@ passes through `LLM_API_KEY` / `LLM_MODEL` for a local server (reported by `/cog
 | `COGNEE_BUFFER_LIMIT` | `100` | Write buffer bound — now enforced on the DISK bridge file too (drop-oldest) as well as the in-memory queue |
 | `COGNEE_BREAKER_THRESHOLD/WINDOW_MS/COOLDOWN_MS` | `5` / `300000` / `120000` | Circuit breaker (only unreachable/5xx count) |
 | `COGNEE_BREAKER_FILE` | `~/.cognee-plugin/pi/breaker.json` | Cross-process breaker state file (open-until + consecutive-failure count, keyed by server URL) |
+| `COGNEE_API_KEY_CACHE` | `~/.cognee-plugin/api_key.json` | Owner-key cache path (parity-shared with the official plugins; override for tests/isolation) |
 | `COGNEE_CODE_STATE_DIR` | `~/.cognee-plugin/pi/code-graph/` | Per-repo index-state directory (dataset + fingerprint + last status; override for tests) |
 | `COGNEE_PI_STATE_DIR` | `~/.cognee-plugin/pi` | Directory holding the persisted dataset-switch record (`active-dataset.json`, keyed by server URL + API-key fingerprint), the disk write bridge (`bridge/<sha1(sid)>.json`), the persisted improve-cooldown (`improve-state/` + `improve-counter.json`), and the cross-process breaker; override for tests. Its **parent** is the shared bootstrap root (venv/locks/pidfile — and the shared credits marker at `<parent>/claude-code/credits.json`), so overriding it also relocates the whole bootstrap cluster |
 | `COGNEE_CODE_AUTOINDEX` | `auto` | Code-graph auto-indexing of new repos: `auto` (loopback server only), `always` (any server), `off`. `COGNEE_CAPTURE=false` disables it as part of all automation |
