@@ -50,7 +50,33 @@ const jiti = createJiti(fileURLToPath(import.meta.url), {
 });
 
 const ext = await jiti.import(path.join(root, "src", "index.ts"));
-const clientMod = await jiti.import(path.join(root, "src", "client.ts"));
+// Post-restructure: the old monolithic src/client.ts is now many modules;
+// merge their exports so the old `clientMod.*` surface keeps working.
+const clientMod = Object.assign(
+	{},
+	...await Promise.all(
+		[
+			"src/client/index.ts",
+			"src/client/agent_key_record.ts",
+			"src/client/helpers.ts",
+			"src/config/index.ts",
+			"src/config/active_dataset_record.ts",
+			"src/config/env_file.ts",
+			"src/constants.ts",
+			"src/helpers/index.ts",
+			"src/helpers/code_graph.ts",
+			"src/helpers/errors.ts",
+			"src/helpers/fingerprint.ts",
+			"src/helpers/git.ts",
+			"src/helpers/remember_file.ts",
+			"src/helpers/shared_breaker.ts",
+			"src/helpers/shared_memory_marker.ts",
+			"src/helpers/tracing.ts",
+		].map((rel) =>
+			jiti.import(path.join(root, ...rel.split("/"))),
+		),
+	),
+);
 
 /* ---------- stub ExtensionAPI that records registrations ---------- */
 

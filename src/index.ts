@@ -6,108 +6,124 @@
  * cognee server is missing, slow, or erroring — every network path is bounded by
  * a short timeout, wrapped in fail-soft try/catch, and gated by a circuit breaker.
  */
-import { Type } from "@earendil-works/pi-ai";
-import type {
-  AgentToolResult,
-  BeforeAgentStartEventResult,
-  ExtensionAPI,
-  ExtensionContext,
-  ExtensionUIContext,
-} from "@earendil-works/pi-coding-agent";
-import { resolve as pathResolve, dirname as pathDirname } from "node:path";
-import { join as pathJoin } from "node:path";
+
 import { readFileSync } from "node:fs";
 import {
-  PINNED_COGNEE_VERSION,
-  bootstrapPaths,
-  cogneeEnvLookup,
-  ensureLocalServerRunning,
-  findUv,
-  logBootstrapEvent,
-  serverPidfileStatus,
-  serverPort,
-  serverPresence,
-  venvCogneeVersion,
+	dirname as pathDirname,
+	join as pathJoin,
+	resolve as pathResolve,
+} from "node:path";
+import { Type } from "@earendil-works/pi-ai";
+import type {
+	AgentToolResult,
+	BeforeAgentStartEventResult,
+	ExtensionAPI,
+	ExtensionContext,
+	ExtensionUIContext,
+} from "@earendil-works/pi-coding-agent";
+import {
+	bootstrapPaths,
+	cogneeEnvLookup,
+	ensureLocalServerRunning,
+	findUv,
+	logBootstrapEvent,
+	PINNED_COGNEE_VERSION,
+	serverPidfileStatus,
+	serverPort,
+	serverPresence,
+	venvCogneeVersion,
 } from "./bootstrap";
 import {
-  CogneeClient,
-  CogneeError,
-  DEFAULT_BREAKER_FILE,
-  DEFAULT_CAPTURE_TOOLS,
-  REMEMBER_FILE_MAX_BYTES,
-  buildCodeQuery,
-  buildTraceEntry,
-  canonicalRepoSpec,
-  clearAgentKeyRecord,
-  codeDatasetName,
-  countSourceFiles,
-  describeError,
-  extractIdentifiers,
-  extractText,
-  findIndexedRepo,
-  gitFingerprint,
-  gitRepoRoot,
-  isLoopbackUrl,
-  isRemoteRepoSpec,
-  isUuid,
-  loadActiveDatasetRecord,
-  loadCogneeConfig,
-  loadRepoStates,
-  loadSharedBreaker,
-  loadSharedMemoryMarker,
-  logPluginEvent,
-  piStateDir,
-  matchDatasets,
-  mintSwitchSessionId,
-  activeDatasetPath,
-  principalFingerprint,
-  readRememberFile,
-  redactSecrets,
-  sanitizeDatasetName,
-  sanitizeSessionId,
-  saveActiveDatasetRecord,
-  saveAgentKeyRecord,
-  saveRepoState,
-  saveSharedBreaker,
-  truncateText,
-  wrapAsCogneeError,
-  type ActiveDatasetRecord,
-  type CogneeConfig,
-  type CodeRepoState,
-  type HealthResult,
-  type QaEntry,
-  type RecallItem,
-  type TraceEntry,
-} from "./client";
+	appendBridge,
+	bridgeBackoffOpen,
+	entryFingerprint,
+	loadBridge,
+	markBridgeHeadAmbiguous,
+	oldestPendingBridgeHead,
+	recordBridgeFailure,
+	resetBridgeFailures,
+	type SpilledEntry,
+	serverFingerprints,
+	sweepOldBridgeFiles,
+	trimBridgeHead,
+	writeOutcomeAmbiguous,
+} from "./bridge";
+import { CogneeClient } from "./client";
 import {
-  AGENT_ROLE_NAME,
-  PROVISIONING_PLUGIN_VERSION,
-  STRUCTURAL_SHARED_MEMORY_FAILURES,
-  type SharedMemoryOutcome,
-} from "./provisioning";
+	clearAgentKeyRecord,
+	saveAgentKeyRecord,
+} from "./client/agent_key_record";
+import type { QaEntry, RecallItem, TraceEntry } from "./client/types";
+import { loadCogneeConfig } from "./config";
 import {
-  bumpStoredCounter,
-  improveThrottleReason,
-  readImproveState,
-  readStoredCounter,
-  recordImproveFailure,
-  recordImproveSuccess,
+	loadActiveDatasetRecord,
+	saveActiveDatasetRecord,
+} from "./config/active_dataset_record";
+import type { ActiveDatasetRecord, CogneeConfig } from "./config/types";
+import { DEFAULT_CAPTURE_TOOLS } from "./constants";
+import {
+	activeDatasetPath,
+	isLoopbackUrl,
+	isUuid,
+	logPluginEvent,
+	matchDatasets,
+	mintSwitchSessionId,
+	piStateDir,
+	principalFingerprint,
+	sanitizeDatasetName,
+	sanitizeSessionId,
+} from "./helpers";
+import {
+	buildCodeQuery,
+	codeDatasetName,
+	extractIdentifiers,
+} from "./helpers/code_graph";
+import {
+	CogneeError,
+	describeError,
+	wrapAsCogneeError,
+} from "./helpers/errors";
+import {
+	canonicalRepoSpec,
+	countSourceFiles,
+	findIndexedRepo,
+	gitFingerprint,
+	gitRepoRoot,
+	isRemoteRepoSpec,
+	loadRepoStates,
+	saveRepoState,
+} from "./helpers/git";
+import {
+	REMEMBER_FILE_MAX_BYTES,
+	readRememberFile,
+} from "./helpers/remember_file";
+import {
+	loadSharedBreaker,
+	saveSharedBreaker,
+	sharedBreakerPath,
+} from "./helpers/shared_breaker";
+import { loadSharedMemoryMarker } from "./helpers/shared_memory_marker";
+import {
+	buildTraceEntry,
+	extractText,
+	redactSecrets,
+	truncateText,
+} from "./helpers/tracing";
+import type { CodeRepoState, HealthResult } from "./helpers/types";
+import {
+	bumpStoredCounter,
+	improveThrottleReason,
+	readImproveState,
+	readStoredCounter,
+	recordImproveFailure,
+	recordImproveSuccess,
 } from "./improve-state";
 import {
-  appendBridge,
-  bridgeBackoffOpen,
-  entryFingerprint,
-  loadBridge,
-  markBridgeHeadAmbiguous,
-  oldestPendingBridgeHead,
-  recordBridgeFailure,
-  resetBridgeFailures,
-  serverFingerprints,
-  sweepOldBridgeFiles,
-  trimBridgeHead,
-  writeOutcomeAmbiguous,
-  type SpilledEntry,
-} from "./bridge";
+	AGENT_ROLE_NAME,
+	PROVISIONING_PLUGIN_VERSION,
+	type SharedMemoryOutcome,
+	STRUCTURAL_SHARED_MEMORY_FAILURES,
+} from "./provisioning";
 
 /** A captured QA entry BOUND to the session+dataset it was captured under.
  *  Binding happens at capture time so a later dataset switch can never
@@ -721,16 +737,6 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
     } catch {
       return "unavailable";
     }
-  }
-
-  /* ----- Circuit breaker (recall path) ----- */
-  // File-shared like the official plugins: the in-memory window stays the fast
-  // path, but open-until/failure-count also live in ~/.cognee-plugin/pi/breaker.json
-  // so concurrent pi processes share outage state instead of each hammering a
-  // down server. All file IO is guarded, atomic (tmp+rename), and never throws.
-
-  function sharedBreakerPath(): string {
-    return process.env.COGNEE_BREAKER_FILE || DEFAULT_BREAKER_FILE;
   }
 
   function recordSuccess(): void {

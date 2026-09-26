@@ -1,28 +1,28 @@
 {
-  "compilerOptions": {
-    "target": "ES2022",
-    "module": "ESNext",
-    "moduleResolution": "bundler",
-    "lib": ["ES2022"],
-    "allowImportingTsExtensions": true,
-    "types": ["node"],
-    "typeRoots": [
-      "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@types"
-    ],
-    "strict": true,
-    "noEmit": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    "noUnusedLocals": true,
-    "noUnusedParameters": true,
-    "paths": {
-      "@earendil-works/pi-ai": [
-        "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/index.d.ts"
-      ],
-      "@earendil-works/pi-coding-agent": [
-        "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"
-      ]
-    }
-  },
-  "include": ["src/**/*.ts"]
+	"compilerOptions": {
+		"target": "ES2022",
+		"module": "ESNext",
+		"moduleResolution": "bundler",
+		"lib": ["ES2022"],
+		"allowImportingTsExtensions": true,
+		"types": ["node"],
+		"typeRoots": [
+			"/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@types",
+		],
+		"strict": true,
+		"noEmit": true,
+		"skipLibCheck": true,
+		"forceConsistentCasingInFileNames": true,
+		"noUnusedLocals": true,
+		"noUnusedParameters": true,
+		"paths": {
+			"@earendil-works/pi-ai": [
+				"/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/index.d.ts",
+			],
+			"@earendil-works/pi-coding-agent": [
+				"/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts",
+			],
+		},
+	},
+	"include": ["src/**/*.ts"],
 }

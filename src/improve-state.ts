@@ -25,7 +25,8 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { describeError, piStateDir } from "./client";
+import { piStateDir } from "./helpers";
+import { describeError } from "./helpers/errors";
 
 /** Reference default (COGNEE_IMPROVE_COOLDOWN = 1800 s), pi keeps its _MS name. */
 export const DEFAULT_IMPROVE_COOLDOWN_MS = 1_800_000;

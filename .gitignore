@@ -2,3 +2,4 @@
 reference/
 research/
 .smoke-state-*/
+node_modules/
