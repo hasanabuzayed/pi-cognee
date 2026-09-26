@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { piStateDir } from "./index";
 
 /* ----- Circuit breaker (recall path) ----- */
 // File-shared like the official plugins: the in-memory window stays the fast
@@ -9,7 +9,7 @@ import { dirname, join } from "node:path";
 // down server. All file IO is guarded, atomic (tmp+rename), and never throws.
 
 export function sharedBreakerPath(): string {
-	return process.env.COGNEE_BREAKER_FILE || DEFAULT_BREAKER_FILE;
+	return process.env.COGNEE_BREAKER_FILE || join(piStateDir(), "breaker.json");
 }
 
 /*
@@ -28,13 +28,6 @@ export interface SharedBreakerEntry {
 /** { "<base_url>": { open_until, consecutive_failures, updated_at } } */
 export type SharedBreakerFile = Record<string, SharedBreakerEntry>;
 
-export const DEFAULT_BREAKER_FILE = join(
-	homedir(),
-	".cognee-plugin",
-	"pi",
-	"breaker.json",
-);
-
 /**
  * Read the shared breaker entry for one server. Stale-read tolerant: a missing,
  * corrupt, or non-object file is an empty entry (never throws), so a half-written
@@ -42,7 +35,7 @@ export const DEFAULT_BREAKER_FILE = join(
  */
 export function loadSharedBreaker(
 	baseUrl: string,
-	filePath: string = DEFAULT_BREAKER_FILE,
+	filePath: string = sharedBreakerPath(),
 ): SharedBreakerEntry {
 	try {
 		const raw = JSON.parse(readFileSync(filePath, "utf8"));
@@ -64,7 +57,7 @@ export function loadSharedBreaker(
 export function saveSharedBreaker(
 	baseUrl: string,
 	entry: SharedBreakerEntry,
-	filePath: string = DEFAULT_BREAKER_FILE,
+	filePath: string = sharedBreakerPath(),
 ): void {
 	try {
 		let all: SharedBreakerFile = {};

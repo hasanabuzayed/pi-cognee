@@ -3,10 +3,10 @@
  *
  * Ported field-for-field from reference/claude-code/scripts/_plugin_common.py
  * (research/v04-provisioning-spec.md §1 is the contract). This module is
- * deliberately dependency-free (node builtins only, no fs, no imports from
- * the sibling modules) so src/client.ts can import it without a cycle; the
- * state-file half of the cluster (agent-key.json / shared-memory.json) lives
- * in client.ts next to the other ~/.cognee-plugin/pi state helpers.
+ * deliberately dependency-free (no imports at all — not even node builtins'
+ * side effects), so every layer can import it without a cycle. The state-file
+ * half of the cluster (agent-key.json / shared-memory.json) lives in
+ * src/state/ and src/client/; the HTTP control plane lives in src/client/.
  *
  * Identity model recap (README gap 4): a provisioned plugin agent is its own
  * user, and cognee's grants flow child→parent only — the parent sees what the
@@ -30,7 +30,7 @@ export const AGENT_ROLE_NAME = "cognee-agent";
  * (server-side fixes ship with plugin bumps — reference parity). Keep in sync
  * with package.json until the release commit pins both.
  */
-export const PROVISIONING_PLUGIN_VERSION = "0.4.0-dev";
+export const PROVISIONING_PLUGIN_VERSION = "0.6.0";
 
 /** A denied grant is retried after this window (reference _GRANT_DENIED_RETRY_SECONDS). */
 export const GRANT_DENIED_RETRY_SECONDS = 3600;

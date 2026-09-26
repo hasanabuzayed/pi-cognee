@@ -23,6 +23,7 @@ import { mkdtempSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { loadClientMod } from "./mod.mjs";
 
 const LIVE = process.env.COGNEE_LIVE_BASE_URL;
 if (!LIVE) {
@@ -62,7 +63,7 @@ const jiti = createJiti(fileURLToPath(import.meta.url), {
   moduleCache: false,
 });
 
-const clientMod = await jiti.import(join(root, "src", "client.ts"));
+const clientMod = await loadClientMod(jiti, root);
 const ext = await jiti.import(join(root, "src", "index.ts"));
 const { CogneeClient, loadCogneeConfig, describeError, redactSecrets, truncateText } = clientMod;
 

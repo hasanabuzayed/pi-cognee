@@ -9,6 +9,7 @@
  */
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { loadClientMod } from "./mod.mjs";
 
 const LIVE = "https://cognee.apps.jazm.dev";
 const DATASET = "pi-cognee";
@@ -28,7 +29,7 @@ const jiti = createJiti(fileURLToPath(import.meta.url), {
   moduleCache: false,
 });
 
-const clientMod = await jiti.import(path.join(root, "src", "client.ts"));
+const clientMod = await loadClientMod(jiti, root);
 const { CogneeClient, loadCogneeConfig, buildCodeQuery, redactSecrets, truncateText } = clientMod;
 
 process.env.COGNEE_BASE_URL = LIVE;

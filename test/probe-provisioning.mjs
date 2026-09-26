@@ -17,6 +17,7 @@
 import assert from "node:assert/strict";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { loadClientMod } from "./mod.mjs";
 
 const LIVE = process.env.COGNEE_LIVE_BASE_URL || "https://cognee.apps.jazm.dev";
 
@@ -35,7 +36,7 @@ const jiti = createJiti(fileURLToPath(import.meta.url), {
   moduleCache: false,
 });
 
-const clientMod = await jiti.import(path.join(root, "src", "client.ts"));
+const clientMod = await loadClientMod(jiti, root);
 const provMod = await jiti.import(path.join(root, "src", "provisioning.ts"));
 
 /* ---------- instrumented fetch: record method+url, refuse non-GETs ---------- */

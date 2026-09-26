@@ -11,6 +11,7 @@
 import assert from "node:assert/strict";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { loadClientMod } from "./mod.mjs";
 
 // Hermetic per-repo state dirs (missing by design — exercises the fail-soft path)
 // BEFORE the client module loads; the real ~/.cognee-plugin state stays untouched.
@@ -50,33 +51,8 @@ const jiti = createJiti(fileURLToPath(import.meta.url), {
 });
 
 const ext = await jiti.import(path.join(root, "src", "index.ts"));
-// Post-restructure: the old monolithic src/client.ts is now many modules;
-// merge their exports so the old `clientMod.*` surface keeps working.
-const clientMod = Object.assign(
-	{},
-	...await Promise.all(
-		[
-			"src/client/index.ts",
-			"src/client/agent_key_record.ts",
-			"src/client/helpers.ts",
-			"src/config/index.ts",
-			"src/config/active_dataset_record.ts",
-			"src/config/env_file.ts",
-			"src/constants.ts",
-			"src/helpers/index.ts",
-			"src/helpers/code_graph.ts",
-			"src/helpers/errors.ts",
-			"src/helpers/fingerprint.ts",
-			"src/helpers/git.ts",
-			"src/helpers/remember_file.ts",
-			"src/helpers/shared_breaker.ts",
-			"src/helpers/shared_memory_marker.ts",
-			"src/helpers/tracing.ts",
-		].map((rel) =>
-			jiti.import(path.join(root, ...rel.split("/"))),
-		),
-	),
-);
+// Post-restructure: merge the split modules' exports (shared list in mod.mjs).
+const clientMod = await loadClientMod(jiti, root);
 
 /* ---------- stub ExtensionAPI that records registrations ---------- */
 
@@ -3276,7 +3252,7 @@ async function withProvisioningHarness(envOverrides, server, fn) {
         granted: {},
         canonical: {},
         updated_at: "2026-09-24T00:00:00Z",
-        plugin_version: "0.4.0-dev",
+        plugin_version: clientMod.PROVISIONING_PLUGIN_VERSION,
         ...over,
       });
     await fn({
@@ -3377,7 +3353,7 @@ await check("provisioning §4.2b: seeded identity + permissions route 404 → ma
     assert.ok(marker, "marker written");
     assert.equal(marker.mode, "separated", "mode separated");
     assert.equal(marker.reason, "unsupported", "reason unsupported");
-    assert.equal(marker.plugin_version, "0.4.0-dev", "plugin version stamped (structural-reason memo key)");
+    assert.equal(marker.plugin_version, clientMod.PROVISIONING_PLUGIN_VERSION, "plugin version stamped (structural-reason memo key)");
     assert.equal(marker.base_url, "https://cognee.invalid", "per-server marker");
     // No tenant/role/grant calls were issued past the probe.
     assert.equal(
@@ -4294,7 +4270,12 @@ await check("resilience §4.5: idle bridge — one improve per arm, cooldown re-
         await new Promise((r) => setTimeout(r, 10));
       }
       assert.equal(improves().length, 1, "idle bridge improved exactly once after the threshold");
-      const logText = resFs.readFileSync(path.join(process.env.COGNEE_PI_STATE_DIR, "bootstrap.log"), "utf8");
+      // Canonical event-log path = <stateRoot>/pi/bootstrap.log (stateRoot = parent
+      // of the pi state dir) — same as bootstrapPaths().bootstrapLog.
+      const logText = resFs.readFileSync(
+        path.join(path.dirname(process.env.COGNEE_PI_STATE_DIR), "pi", "bootstrap.log"),
+        "utf8",
+      );
       assert.ok(
         logText.includes('"event":"improve_submitted"') && logText.includes('"trigger":"idle"'),
         "trigger logged (improve_submitted, trigger idle)",

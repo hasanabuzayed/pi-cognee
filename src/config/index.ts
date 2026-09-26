@@ -4,8 +4,8 @@ import { datasetKeyFingerprint, sanitizeDatasetName } from "../helpers";
 import { parsePluginIdentityMode, parseSharedAgentMemory } from "../provisioning";
 import { loadActiveDatasetRecord } from "./active_dataset_record";
 import {
-    autoindexMode,
-    bool,
+	autoindexMode,
+	bool,
 	type EnvLookup,
 	loadCogneeEnvFile,
 	num,

@@ -7,7 +7,7 @@
  * (research/v04-bootstrap-spec.md is the contract).
  *
  * Constraints honored:
- * - No MCP, no npm deps; node builtins only (plus client.ts helpers).
+ * - No MCP, no npm deps; node builtins only (plus the helpers/config modules).
  * - This module defines functions and spawns NOTHING at import time. Every
  *   spawn happens inside ensureLocalServerRunning()/ensureCogneeInstalled(),
  *   which are only ever called from the session_start handler or the health
@@ -22,7 +22,6 @@
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import {
 	accessSync,
-	appendFileSync,
 	closeSync,
 	existsSync,
 	constants as fsConstants,
@@ -30,7 +29,6 @@ import {
 	openSync,
 	readFileSync,
 	renameSync,
-	statSync,
 	unlinkSync,
 	writeFileSync,
 	writeSync,
@@ -40,6 +38,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { isLoopbackUrl, piStateDir, sleep } from "./helpers";
+import { appendRotatedJsonl } from "./helpers/log";
 import { type EnvLookup, loadCogneeEnvFile } from "./config/env_file";
 import { describeError } from "./helpers/errors";
 
@@ -174,34 +173,7 @@ export function logBootstrapEvent(
 	event: Record<string, unknown>,
 	stateRoot?: string,
 ): void {
-	try {
-		const paths = bootstrapPaths(stateRoot);
-		mkdirSync(dirname(paths.bootstrapLog), { recursive: true });
-		const maxBytes = envNumber(
-			"COGNEE_PLUGIN_LOG_MAX_BYTES",
-			20 * 1024 * 1024,
-		);
-		try {
-			const st = statSync(paths.bootstrapLog);
-			if (st.size >= maxBytes) {
-				try {
-					unlinkSync(`${paths.bootstrapLog}.1`);
-				} catch {
-					/* no previous rotation */
-				}
-				renameSync(paths.bootstrapLog, `${paths.bootstrapLog}.1`);
-			}
-		} catch {
-			/* absent — first line */
-		}
-		appendFileSync(
-			paths.bootstrapLog,
-			`${JSON.stringify({ ts: new Date().toISOString(), ...event })}\n`,
-			"utf8",
-		);
-	} catch {
-		/* fail-soft — logging must never break the boot */
-	}
+	appendRotatedJsonl(bootstrapPaths(stateRoot).bootstrapLog, event);
 }
 
 /* ------------------------------------------------------------------ */

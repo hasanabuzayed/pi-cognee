@@ -58,10 +58,10 @@ export interface RememberParams {
  *  identical to the stored copy — nothing was sent. Only the explicit-filename
  *  (real file upload) lane can produce "updated"/"unchanged"; prose memories
  *  use timestamped synthetic names and stay append-only by design. */
-export type RememberOutcome = "stored" | "updated" | "unchanged";
+type RememberOutcome = "stored" | "updated" | "unchanged";
 
 /** Structured outcome of the update path (PATCH /api/v1/update). */
-export interface RememberUpdateInfo {
+interface RememberUpdateInfo {
 	/** Server status: incremental | unchanged | full_rebuild ("failed" returns ok:false). */
 	status: string;
 	/** One compact line for humans: "+3/−1 chunks, 12 kept" / "memory dropped and rebuilt (fallback: …)". */

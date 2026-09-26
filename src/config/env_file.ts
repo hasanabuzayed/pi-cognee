@@ -17,7 +17,7 @@ export type { EnvLookup };
 /* Mirrors reference _dataset_access.py recall_fields' env lane.       */
 /* ------------------------------------------------------------------ */
 
-export interface ReadDatasetIdsResult {
+interface ReadDatasetIdsResult {
 	/** Canonical UUIDs, deduped preserving first-seen order; absent when unset/blank/invalid. */
 	datasetIds?: string[];
 	/** Exact reference error string when the value is present but malformed. */
@@ -53,7 +53,7 @@ export function parseEnvFile(text: string): Record<string, string> {
 	return out;
 }
 
-export interface EnvFileResult {
+interface EnvFileResult {
 	path: string;
 	exists: boolean;
 	values: Record<string, string>;

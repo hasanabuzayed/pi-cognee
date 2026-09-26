@@ -14,6 +14,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { loadClientMod } from "./mod.mjs";
 
 const LIVE = process.env.COGNEE_LIVE_BASE_URL;
 if (!LIVE) {
@@ -36,7 +37,7 @@ const jiti = createJiti(fileURLToPath(import.meta.url), {
   moduleCache: false,
 });
 
-const clientMod = await jiti.import(path.join(root, "src", "client.ts"));
+const clientMod = await loadClientMod(jiti, root);
 const {
   CogneeClient,
   loadCogneeConfig,

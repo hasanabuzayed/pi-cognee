@@ -17,7 +17,7 @@ export const REMEMBER_FILE_MAX_BYTES = 200_000;
 const SENSITIVE_REMEMBER_PATH_RE =
 	/(?:^|[\\/])\.ssh(?:[\\/]|$)|(?:^|[\\/])\.env(?:[\\/.]|$)|(?:^|[\\/])id_(?:rsa|dsa|ecdsa|ed25519)|(?:^|[\\/])credentials[^\\/]*$|\.pem$/i;
 
-export interface RememberFileResult {
+interface RememberFileResult {
 	ok: boolean;
 	/** File text (utf-8) — verbatim, NOT redacted (code must route as code). */
 	text?: string;

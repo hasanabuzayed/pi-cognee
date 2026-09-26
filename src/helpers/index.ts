@@ -1,48 +1,9 @@
-import {
-	mkdirSync,
-	renameSync,
-	statSync,
-	unlinkSync,
-	writeFileSync,
-} from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_PI_STATE_DIR } from "../constants";
 import { datasetKeyFingerprint, principalFingerprint } from "./fingerprint";
 import { createHash } from "node:crypto";
 
-/** Provisioning event log — same JSON-lines bootstrap.log the v0.4 bootstrap
- *  cluster writes (rotated at COGNEE_PLUGIN_LOG_MAX_BYTES). Fail-soft. */
-export function logPluginEvent(event: Record<string, unknown>): void {
-	try {
-		const path = join(piStateDir(), "bootstrap.log");
-		mkdirSync(piStateDir(), { recursive: true });
-		let maxBytes = 20 * 1024 * 1024;
-		const raw = process.env.COGNEE_PLUGIN_LOG_MAX_BYTES;
-		if (raw) {
-			const parsed = Number(raw);
-			if (Number.isFinite(parsed) && parsed >= 0) maxBytes = parsed;
-		}
-		try {
-			if (statSync(path).size >= maxBytes) {
-				try {
-					unlinkSync(`${path}.1`);
-				} catch {
-					/* no previous rotation */
-				}
-				renameSync(path, `${path}.1`);
-			}
-		} catch {
-			/* absent — first line */
-		}
-		writeFileSync(
-			path,
-			`${JSON.stringify({ ts: new Date().toISOString(), ...event })}\n`,
-			{ flag: "a" },
-		);
-	} catch {
-		/* fail-soft */
-	}
-}
+export { logPluginEvent } from "./log";
 
 /** Local-mode quickstart servers live on the loopback interface. Same predicate as the
  *  official plugins' service_url_is_local: consent for auto-index = the code never

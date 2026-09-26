@@ -26,6 +26,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { loadClientMod } from "./mod.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
@@ -38,7 +39,7 @@ const jiti = createJiti(fileURLToPath(import.meta.url), {
   moduleCache: false,
 });
 const bootMod = await jiti.import(path.join(root, "src", "bootstrap.ts"));
-const clientMod = await jiti.import(path.join(root, "src", "client.ts"));
+const clientMod = await loadClientMod(jiti, root);
 
 const HARD_BUDGET_MS = 9.5 * 60_000;
 const started = Date.now();
