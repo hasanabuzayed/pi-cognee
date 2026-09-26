@@ -19,7 +19,6 @@ import type {
 	BeforeAgentStartEventResult,
 	ExtensionAPI,
 	ExtensionContext,
-	ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
 import {
 	bootstrapPaths,
@@ -104,13 +103,15 @@ import {
 	sharedBreakerPath,
 } from "./helpers/shared_breaker";
 import { loadSharedMemoryMarker } from "./state/shared_memory";
+import { runHealthCheck, type HealthDeps } from "./health";
+import { createSessionState, type BoundQaEntry, type BoundTraceEntry, type PendingEntry } from "./session";
 import {
 	buildTraceEntry,
 	extractText,
 	redactSecrets,
 	truncateText,
 } from "./helpers/tracing";
-import type { CodeRepoState, HealthResult } from "./helpers/types";
+import type { CodeRepoState } from "./helpers/types";
 import {
 	bumpStoredCounter,
 	improveThrottleReason,
@@ -126,21 +127,6 @@ import {
 	STRUCTURAL_SHARED_MEMORY_FAILURES,
 } from "./contract";
 
-/** A captured QA entry BOUND to the session+dataset it was captured under.
- *  Binding happens at capture time so a later dataset switch can never
- *  mis-attribute buffered writes into the new dataset (the reference binds
- *  pending entries to the retired triple the same way). The binding is
- *  plugin-internal — it is stripped before the wire payload is built. */
-type BoundQaEntry = QaEntry & { sessionId: string; dataset: string };
-
-/** A captured tool-call trace entry with the same capture-time binding. */
-type BoundTraceEntry = TraceEntry & { sessionId: string; dataset: string };
-
-/** Any queued entry as seen by the drain: bound + the bridge's replay meta. */
-type PendingEntry = (BoundQaEntry | BoundTraceEntry) & {
-  _replay_ambiguous?: true;
-  _buffered_at?: number;
-};
 
 /* ------------------------------------------------------------------ */
 /* Limits (aligned with the official plugins' capture policy)          */
@@ -356,22 +342,6 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
   const cfg: CogneeConfig = loadCogneeConfig();
   const client = new CogneeClient(cfg);
 
-  /* Shared-memory addressing seed (v0.4): the persisted record's UUIDs win
-   * (a dataset match is implied — the record's dataset IS cfg.dataset), else
-   * the live marker's canonical map (the reference's launch-record →
-   * marker-canonical precedence, dataset_id_for). Empty → name addressing. */
-  const initialMarker = loadSharedMemoryMarker(cfg.baseUrl);
-  const initialCanonicalId =
-    cfg.sharedAgentMemory && initialMarker.mode === "shared"
-      ? initialMarker.canonical?.[cfg.dataset] ?? ""
-      : "";
-  const initialSharedDatasetId = cfg.sharedDatasetId || initialCanonicalId;
-  const initialSharedDatasetIds = cfg.sharedDatasetIds?.length
-    ? cfg.sharedDatasetIds
-    : initialSharedDatasetId
-      ? [initialSharedDatasetId]
-      : [];
-
   /** Suffix for graph-read tool descriptions when federated reads are configured
    *  (the reference teaches the model about the widened read set only when set). */
   const federatedReadNote = cfg.readDatasetIds?.length
@@ -381,66 +351,23 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
       "memory stay on the session dataset."
     : "";
 
-  const state = {
-    stopped: false,
-    healthy: false,
-    lastError: "" as string,
-    lastCheckAt: 0,
-    failureTimestamps: [] as number[],
-    breakerOpenUntil: 0,
-    breakerFileSyncedAt: 0,
-    degradedNotified: false,
-    datasetEnsured: false,
-    sessionId: "",
-    dataset: cfg.dataset,
-    /* switch provenance — set from the persisted record, updated on a live switch */
-    datasetSource: cfg.datasetSource,
-    datasetSwitchedFrom: cfg.datasetSwitchedFrom ?? null,
-    datasetSwitchedAt: cfg.datasetSwitchedAt ?? null,
-    pendingQuestion: null as string | null,
-    pendingAnswer: null as string | null,
-    writeQueue: [] as (BoundQaEntry | BoundTraceEntry)[],
-    draining: false,
-    /* connection verdict for the statusline glyph slot (single left slot,
-     * reference precedence: connection failure > llm-key > server signal) */
-    connState: "unknown" as "unknown" | "ok" | "offline" | "auth" | "server-error",
-    /* last recall turn's hit counts (statusline recall segment, spec §2.1) */
-    lastRecallHits: 0,
-    lastGraphHits: 0,
-    lastCodeHits: 0,
-    /* idle bridge (spec §2.2): the single arm timer + its one re-arm */
-    idleTimer: undefined as ReturnType<typeof setTimeout> | undefined,
-    /* per-target improve re-entry guard (server busy-locks per session) */
-    improvesInFlight: new Set<string>(),
-    /* verify-before-replay consumptions (surfaced by /cognee) */
-    dedupedCount: 0,
-    /* re-entry guard for the dataset-switch command (in-process analog of the reference .switch.lock) */
-    switching: false,
-    /* sessions retired by a --force switch past a failed sync: finalSync promotes them too */
-    retiredSessions: [] as { sessionId: string; dataset: string }[],
-    capturedCount: 0,
-    droppedCount: 0,
-    lastImprovedCount: 0,
-    totalRecallTurns: 0,
-    turnsWithHits: 0,
-    finalSyncDone: false,
-    timers: new Set<ReturnType<typeof setTimeout>>(),
-    hasUI: false,
-    ui: undefined as ExtensionUIContext | undefined,
-    /* code-graph (enola) state */
-    cwd: "",
-    autoIndexTried: false,
-    lastCodeSubmitAt: 0,
-    codeReindexTimer: undefined as ReturnType<typeof setTimeout> | undefined,
-    /* local server bootstrap (v0.4) — once per pi process */
-    bootstrapStarted: false,
-    bootstrapStatus: "idle" as "idle" | "running" | "done" | "failed",
-    bootstrapError: undefined as string | undefined,
-    /* shared-agent-memory provisioning (v0.4) — once per session, after health */
-    provisioningDone: false,
-    sharedDatasetId: initialSharedDatasetId,
-    sharedDatasetIds: initialSharedDatasetIds,
+  const state = createSessionState(cfg);
+
+  /* Health orchestration deps (src/health.ts owns the probe choreography;
+   * the factory keeps the UI/wiring glue). Function declarations hoist. */
+  const healthDeps: HealthDeps = {
+    client,
+    cfg,
+    state,
+    notifySafe,
+    renderStatusline,
+    recordSuccess,
+    drainWriteQueue,
+    runProvisioningFlow,
+    autoIndexOnStart,
+    maybeBootstrap,
   };
+
 
   /* ----- UI helpers (mode-guarded, fail-soft) ----- */
 
@@ -885,7 +812,7 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
     } finally {
       // The existing health path takes it from here: ●/✕ status, owner-key mint,
       // dataset ensure, write-queue drain (the guard makes this re-entry a no-op).
-      void runHealthCheck({ notify: true }).catch(() => {});
+      void runHealthCheck(healthDeps, { notify: true }).catch(() => {});
     }
   }
 
@@ -1088,69 +1015,12 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
 
   /* ----- Health check + background re-probe ----- */
 
-  async function runHealthCheck(opts: { notify: boolean }): Promise<HealthResult> {
-    if (state.stopped) return { reachable: false, latencyMs: 0, error: "extension stopped" };
-    const result = await client.health();
-    state.lastCheckAt = Date.now();
-    if (result.reachable) {
-      state.healthy = true;
-      state.lastError = "";
-      recordSuccess();
-      // Loopback server with no key yet — start the owner-key bootstrap in the
-      // background so the first authenticated call rarely waits for it.
-      void client.ensureAuth().catch(() => {});
-      if (!state.datasetEnsured) {
-        state.datasetEnsured = true;
-        void client.ensureDataset(state.dataset).catch(() => {
-          /* best-effort; the server creates datasets implicitly on write */
-        });
-      }
-      void drainWriteQueue().catch(() => {});
-      // Shared-agent-memory provisioning runs after health resolves — once per
-      // session, bounded, fail-soft (never blocks this probe's caller).
-      void runProvisioningFlow().catch(() => {});
-      // Code-graph auto-index: one background attempt per session, only after the
-      // server is confirmed healthy (never blocks startup; never fires when down).
-      if (!state.autoIndexTried && state.cwd) {
-        state.autoIndexTried = true;
-        const timer = setTimeout(() => {
-          state.timers.delete(timer);
-          void autoIndexOnStart(state.cwd).catch(() => {});
-        }, 100);
-        state.timers.add(timer);
-      }
-      state.connState = "ok";
-      renderStatusline();
-      if (opts.notify || state.degradedNotified) {
-        state.degradedNotified = false;
-        notifySafe("Cognee Memory Connected", "info");
-      }
-      return result;
-    }
-    state.healthy = false;
-    state.lastError = result.error ?? "unreachable";
-    state.connState = "offline";
-    // T2 bootstrap trigger: an unreachable local server may be bootable (the
-    // once-guard inside maybeBootstrap makes this cheap after the first time).
-    void maybeBootstrap().catch(() => {});
-    // Same information set as the official statusline (health · backend · dataset).
-    renderStatusline();
-    if (opts.notify && !state.degradedNotified) {
-      state.degradedNotified = true;
-      notifySafe(
-        `Cognee memory offline (${cfg.missingBaseUrl ? "COGNEE_BASE_URL missing for forced cloud mode" : state.lastError}). ` +
-          "Memory features are disabled; everything else works normally. Run /cognee-doctor to diagnose.",
-        "warning",
-      );
-    }
-    return result;
-  }
 
   function scheduleReprobe(): void {
     if (state.stopped || state.healthy) return;
     const timer = setTimeout(() => {
       state.timers.delete(timer);
-      void runHealthCheck({ notify: false })
+      void runHealthCheck(healthDeps, { notify: false })
         .catch(() => {})
         .finally(() => scheduleReprobe());
     }, REPROBE_INTERVAL_MS);
@@ -2261,7 +2131,7 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
       try {
         // Full health path (breaker reset, dataset ensure, queue drain, status text)
         // — never mutate state.healthy by hand.
-        const health = await runHealthCheck({ notify: false });
+        const health = await runHealthCheck(healthDeps, { notify: false });
         const lines = [
           `Cognee Memory — ${health.reachable ? "connected" : "offline"}`,
           `  Mode:      ${cfg.backend}${cfg.backendForced ? ` (forced by COGNEE_BACKEND=${cfg.backend})` : ""}${cfg.missingBaseUrl ? " — ✕ COGNEE_BASE_URL missing" : ""}`,
@@ -2905,7 +2775,7 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
         // 5. Lanes re-pointed (capture/recall/sync/statusline read state.dataset);
         //    the code lane and federation stay independent of the session dataset.
         renderStatusline();
-        void runHealthCheck({ notify: false }).catch(() => {}); // ensure + refresh state
+        void runHealthCheck(healthDeps, { notify: false }).catch(() => {}); // ensure + refresh state
         report(
           ctx,
           [
@@ -3096,7 +2966,7 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
         void maybeBootstrap()
           .catch(() => {})
           .finally(() => {
-            void runHealthCheck({ notify: true })
+            void runHealthCheck(healthDeps, { notify: true })
               .catch(() => {})
               .finally(() => scheduleReprobe());
           });
@@ -3136,7 +3006,7 @@ export default function cogneeExtension(pi: ExtensionAPI): void {
       if (breakerOpen()) return recallSkipped("circuit breaker open");
       if (!state.healthy) {
         // Bounded background re-entry probe; never blocks this turn.
-        void runHealthCheck({ notify: false }).catch(() => {});
+        void runHealthCheck(healthDeps, { notify: false }).catch(() => {});
         return recallSkipped("server unreachable");
       }
       // Code recall lane: armed only when the prompt carries an identifier-shaped

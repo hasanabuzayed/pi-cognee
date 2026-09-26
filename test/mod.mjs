@@ -19,6 +19,7 @@ export const SRC_MODULES = [
 	"src/config/index.ts",
 	"src/config/env_file.ts",
 	"src/constants.ts",
+	"src/health.ts",
 	"src/contract.ts",
 	"src/helpers/index.ts",
 	"src/helpers/code_graph.ts",
@@ -36,6 +37,7 @@ export const SRC_MODULES = [
 	"src/state/api_key.ts",
 	"src/state/improve_state.ts",
 	"src/state/shared_memory.ts",
+	"src/session.ts",
 ];
 
 /** Merge every split module's exports into one clientMod-style surface. */
