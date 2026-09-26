@@ -13,7 +13,9 @@ import path from "node:path";
 
 export const SRC_MODULES = [
 	"src/client/index.ts",
-	"src/client/helpers.ts",
+	"src/client/identity.ts",
+	"src/client/provisioning.ts",
+	"src/client/transport.ts",
 	"src/config/index.ts",
 	"src/config/env_file.ts",
 	"src/constants.ts",
