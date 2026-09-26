@@ -37,7 +37,7 @@ const jiti = createJiti(fileURLToPath(import.meta.url), {
 });
 
 const clientMod = await loadClientMod(jiti, root);
-const provMod = await jiti.import(path.join(root, "src", "provisioning.ts"));
+const provMod = await jiti.import(path.join(root, "src", "contract.ts"));
 
 /* ---------- instrumented fetch: record method+url, refuse non-GETs ---------- */
 

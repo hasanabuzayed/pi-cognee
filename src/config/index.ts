@@ -1,8 +1,8 @@
-import { loadCachedApiKey } from "../client/cashed_api_key";
+import { loadCachedApiKey } from "../state/api_key";
 import { CLOUD_ALIASES, DEFAULT_CAPTURE_TOOLS, LOCAL_ALIASES } from "../constants";
 import { datasetKeyFingerprint, sanitizeDatasetName } from "../helpers";
-import { parsePluginIdentityMode, parseSharedAgentMemory } from "../provisioning";
-import { loadActiveDatasetRecord } from "./active_dataset_record";
+import { parsePluginIdentityMode, parseSharedAgentMemory } from "../contract";
+import { loadActiveDatasetRecord } from "../state/active_dataset";
 import {
 	autoindexMode,
 	bool,

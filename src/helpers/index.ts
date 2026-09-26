@@ -11,7 +11,6 @@ export * from "./naming";
 export * from "./paths";
 export * from "./remember_file";
 export * from "./shared_breaker";
-export * from "./shared_memory_marker";
 export * from "./tracing";
 export * from "./types";
 

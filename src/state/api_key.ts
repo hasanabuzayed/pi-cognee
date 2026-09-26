@@ -1,12 +1,17 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { readFileSync } from "node:fs";
 import { API_KEY_CACHE_PATH } from "../constants";
-import type { CachedApiKeyFile } from "./types";
+import { atomicWriteJson } from "./atomic";
 
 /* ------------------------------------------------------------------ */
 /* Owner-key cache (~/.cognee-plugin/api_key.json)                      */
 /* Shared with the Claude Code / Codex cognee plugins.                  */
 /* ------------------------------------------------------------------ */
+
+interface CachedApiKeyFile {
+	base_url?: string;
+	api_key?: string;
+	updated_at?: string;
+}
 
 /** Read the cached owner key; only honored when it was minted for this server. */
 export function loadCachedApiKey(baseUrl: string): string | undefined {
@@ -30,18 +35,14 @@ export function loadCachedApiKey(baseUrl: string): string | undefined {
 
 export function saveCachedApiKey(baseUrl: string, key: string): void {
 	try {
-		mkdirSync(dirname(API_KEY_CACHE_PATH), { recursive: true });
-		writeFileSync(
+		// atomic + 0600: same guarantees as the other state writers
+		atomicWriteJson(
 			API_KEY_CACHE_PATH,
-			JSON.stringify(
-				{
-					base_url: baseUrl,
-					api_key: key,
-					updated_at: new Date().toISOString(),
-				},
-				null,
-				2,
-			) + "\n",
+			{
+				base_url: baseUrl,
+				api_key: key,
+				updated_at: new Date().toISOString(),
+			},
 			{ mode: 0o600 },
 		);
 	} catch {

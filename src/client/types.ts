@@ -135,24 +135,6 @@ export interface CapabilityVerdict {
 	typedDatasetIds: boolean;
 }
 
-/** ~/.cognee-plugin/pi/agent-key.json (spec §3.2; the reference's agent_key.json). */
-export interface AgentKeyRecord {
-	base_url: string;
-	api_key: string;
-	agent_id: string;
-	plugin_key: string;
-	/** sha256(principal key) — binds the identity to the principal that minted it. */
-	principal_fingerprint: string;
-	updated_at: string;
-	/** Stamped when the server rejects the key; never auto-re-provisioned. */
-	blocked?: boolean;
-}
-
-export interface CachedApiKeyFile {
-	base_url?: unknown;
-	api_key?: unknown;
-}
-
 export interface RawFetchOptions {
 	method: string;
 	headers?: Record<string, string>;

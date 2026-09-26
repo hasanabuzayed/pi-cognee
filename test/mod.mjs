@@ -13,12 +13,11 @@ import path from "node:path";
 
 export const SRC_MODULES = [
 	"src/client/index.ts",
-	"src/client/agent_key_record.ts",
 	"src/client/helpers.ts",
 	"src/config/index.ts",
-	"src/config/active_dataset_record.ts",
 	"src/config/env_file.ts",
 	"src/constants.ts",
+	"src/contract.ts",
 	"src/helpers/index.ts",
 	"src/helpers/code_graph.ts",
 	"src/helpers/errors.ts",
@@ -29,9 +28,12 @@ export const SRC_MODULES = [
 	"src/helpers/paths.ts",
 	"src/helpers/remember_file.ts",
 	"src/helpers/shared_breaker.ts",
-	"src/helpers/shared_memory_marker.ts",
 	"src/helpers/tracing.ts",
-	"src/provisioning.ts",
+	"src/state/active_dataset.ts",
+	"src/state/agent_key.ts",
+	"src/state/api_key.ts",
+	"src/state/improve_state.ts",
+	"src/state/shared_memory.ts",
 ];
 
 /** Merge every split module's exports into one clientMod-style surface. */

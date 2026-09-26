@@ -120,30 +120,3 @@ export interface CogneeConfig {
 	 *  after env federation, before the explicit dataset). */
 	sharedDatasetIds?: string[];
 }
-
-/* ------------------------------------------------------------------ */
-/* Persisted dataset switch (~/.cognee-plugin/pi/active-dataset.json)  */
-/* The pi analog of the reference launch record: a switch must survive  */
-/* restarts and resumes. pi has no stable host session id across        */
-/* processes, so this record IS the session affinity.                   */
-/* ------------------------------------------------------------------ */
-
-export interface ActiveDatasetRecord {
-  /** Server the switch was recorded for — never served to another backend. */
-  base_url: string;
-  /** sha256(baseUrl + effective api key) — same discipline as the reference's
-   *  readable-datasets cache: an active dataset minted for one identity is
-   *  never served to another. Keys on the PRINCIPAL key (never the agent key —
-   *  flipping to a plugin identity must not orphan the persisted switch). */
-  key_fp: string;
-  dataset: string;
-  /** Ordinal-suffixed session id minted by the switch (adopted on restart). */
-  session_id: string;
-  /** Canonical write UUID under shared memory (v0.4; "" → name addressing). */
-  dataset_id?: string;
-  /** Shared-memory recall read set (v0.4; write UUID + same-named copies). */
-  dataset_ids?: string[];
-  /** The retired triple (the reference keeps these in `touched`). */
-  previous?: { dataset: string; session_id: string; synced: boolean };
-  switched_at: string;
-}

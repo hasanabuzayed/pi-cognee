@@ -26,10 +26,7 @@ import {
 	errorStringFromUpdateBody,
 	wrapAsCogneeError,
 } from "../helpers/errors";
-import {
-	loadSharedMemoryMarker,
-	saveSharedMemoryMarker,
-} from "../helpers/shared_memory_marker";
+import { loadSharedMemoryMarker, saveSharedMemoryMarker } from "../state/shared_memory";
 import type { HealthResult } from "../helpers/types";
 import {
 	AGENT_ROLE_NAME,
@@ -44,9 +41,9 @@ import {
 	separatedOutcome,
 	validateProvisionResponse,
 	type WritableDatasetsListing,
-} from "../provisioning";
-import { blockAgentKeyRecord, loadAgentKeyRecord } from "./agent_key_record";
-import { loadCachedApiKey, saveCachedApiKey } from "./cashed_api_key";
+} from "../contract";
+import { blockAgentKeyRecord, loadAgentKeyRecord } from "../state/agent_key";
+import { loadCachedApiKey, saveCachedApiKey } from "../state/api_key";
 import { updateSummaryLine } from "./helpers";
 import type {
 	CapabilityVerdict,

@@ -3833,7 +3833,7 @@ await check("provisioning §4.9: strict-mode obstacles are one-line warnings (ne
 /* ---------- v0.4: resilience cluster — statusline + idle bridge + disk bridge (offline, spec §4) ---------- */
 
 const bridgeMod = await jiti.import(path.join(root, "src", "bridge.ts"));
-const improveMod = await jiti.import(path.join(root, "src", "improve-state.ts"));
+const improveMod = await jiti.import(path.join(root, "src", "state", "improve_state.ts"));
 const resFs = await import("node:fs");
 const resOs = await import("node:os");
 

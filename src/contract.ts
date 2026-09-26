@@ -1,12 +1,13 @@
 /**
- * pi-cognee — shared-agent-memory provisioning: pure helpers (v0.4).
+ * pi-cognee — shared-agent-memory contract (v0.4): the pure, import-free
+ * constants, types, and parsers every layer shares.
  *
  * Ported field-for-field from reference/claude-code/scripts/_plugin_common.py
  * (research/v04-provisioning-spec.md §1 is the contract). This module is
  * deliberately dependency-free (no imports at all — not even node builtins'
  * side effects), so every layer can import it without a cycle. The state-file
- * half of the cluster (agent-key.json / shared-memory.json) lives in
- * src/state/ and src/client/; the HTTP control plane lives in src/client/.
+ * half of the cluster (agent-key.json / shared-memory.json) lives in src/state/;
+ * the HTTP control plane lives in src/client/.
  *
  * Identity model recap (README gap 4): a provisioned plugin agent is its own
  * user, and cognee's grants flow child→parent only — the parent sees what the

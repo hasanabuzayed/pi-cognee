@@ -1,14 +1,21 @@
-import {
-	mkdirSync,
-	readFileSync,
-	renameSync,
-	unlinkSync,
-	writeFileSync,
-} from "node:fs";
+import { readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { piStateDir } from "../helpers";
-import { PLUGIN_KEY } from "../provisioning";
-import type { AgentKeyRecord } from "./types";
+import { PLUGIN_KEY } from "../contract";
+import { piStateDir } from "../helpers/paths";
+import { atomicWriteJson } from "./atomic";
+
+/** ~/.cognee-plugin/pi/agent-key.json (spec §3.2; the reference's agent_key.json). */
+export interface AgentKeyRecord {
+	base_url: string;
+	api_key: string;
+	agent_id: string;
+	plugin_key: string;
+	/** sha256(principal key) — binds the identity to the principal that minted it. */
+	principal_fingerprint: string;
+	updated_at: string;
+	/** Stamped when the server rejects the key; never auto-re-provisioned. */
+	blocked?: boolean;
+}
 
 function agentKeyPath(): string {
 	return join(piStateDir(), "agent-key.json");
@@ -55,21 +62,11 @@ export function loadAgentKeyRecord(
 /** Atomically persist the plugin identity (0600, tmp + rename). Never throws. */
 export function saveAgentKeyRecord(record: AgentKeyRecord): void {
 	try {
-		mkdirSync(piStateDir(), { recursive: true });
-		const tmp = `${agentKeyPath()}.${process.pid}.tmp`;
-		writeFileSync(
-			tmp,
-			JSON.stringify(
-				{ ...record, updated_at: new Date().toISOString() },
-				null,
-				2,
-			) + "\n",
-			{
-				encoding: "utf8",
-				mode: 0o600,
-			},
+		atomicWriteJson(
+			agentKeyPath(),
+			{ ...record, updated_at: new Date().toISOString() },
+			{ mode: 0o600 },
 		);
-		renameSync(tmp, agentKeyPath());
 	} catch {
 		/* fail-soft — the key stays in memory for this session */
 	}

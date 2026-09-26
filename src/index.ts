@@ -52,14 +52,15 @@ import { CogneeClient } from "./client";
 import {
 	clearAgentKeyRecord,
 	saveAgentKeyRecord,
-} from "./client/agent_key_record";
+} from "./state/agent_key";
 import type { QaEntry, RecallItem, TraceEntry } from "./client/types";
 import { loadCogneeConfig } from "./config";
 import {
 	loadActiveDatasetRecord,
 	saveActiveDatasetRecord,
-} from "./config/active_dataset_record";
-import type { ActiveDatasetRecord, CogneeConfig } from "./config/types";
+	type ActiveDatasetRecord,
+} from "./state/active_dataset";
+import type { CogneeConfig } from "./config/types";
 import { DEFAULT_CAPTURE_TOOLS } from "./constants";
 import {
 	activeDatasetPath,
@@ -102,7 +103,7 @@ import {
 	saveSharedBreaker,
 	sharedBreakerPath,
 } from "./helpers/shared_breaker";
-import { loadSharedMemoryMarker } from "./helpers/shared_memory_marker";
+import { loadSharedMemoryMarker } from "./state/shared_memory";
 import {
 	buildTraceEntry,
 	extractText,
@@ -117,13 +118,13 @@ import {
 	readStoredCounter,
 	recordImproveFailure,
 	recordImproveSuccess,
-} from "./improve-state";
+} from "./state/improve_state";
 import {
 	AGENT_ROLE_NAME,
 	PROVISIONING_PLUGIN_VERSION,
 	type SharedMemoryOutcome,
 	STRUCTURAL_SHARED_MEMORY_FAILURES,
-} from "./provisioning";
+} from "./contract";
 
 /** A captured QA entry BOUND to the session+dataset it was captured under.
  *  Binding happens at capture time so a later dataset switch can never

@@ -1,13 +1,14 @@
 /* ------------------------------------------------------------------ */
 /* Shared-agent-memory provisioning state (v0.4 — spec §3.2)          */
-/* ~/.cognee-plugin/pi/agent-key.json + shared-memory.json, alongside  */
-/* active-dataset.json. Fail-soft + atomic like every state writer.    */
+/* ~/.cognee-plugin/pi/shared-memory.json, alongside agent-key.json    */
+/* and active-dataset.json. Fail-soft + atomic like every state writer. */
 /* ------------------------------------------------------------------ */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { PROVISIONING_PLUGIN_VERSION, type SharedMemoryMarker } from "../provisioning";
-import { piStateDir } from "./paths";
+import { PROVISIONING_PLUGIN_VERSION, type SharedMemoryMarker } from "../contract";
+import { piStateDir } from "../helpers/paths";
+import { atomicWriteJson } from "./atomic";
 
 export function sharedMemoryMarkerPath(): string {
 	return join(piStateDir(), "shared-memory.json");
@@ -37,22 +38,11 @@ export function loadSharedMemoryMarker(baseUrl: string): SharedMemoryMarker {
  *  reason is only structural for THIS version — §2.4). Never throws. */
 export function saveSharedMemoryMarker(marker: SharedMemoryMarker): void {
 	try {
-		mkdirSync(piStateDir(), { recursive: true });
-		const tmp = `${sharedMemoryMarkerPath()}.${process.pid}.tmp`;
-		writeFileSync(
-			tmp,
-			JSON.stringify(
-				{
-					...marker,
-					updated_at: new Date().toISOString(),
-					plugin_version: PROVISIONING_PLUGIN_VERSION,
-				},
-				null,
-				2,
-			) + "\n",
-			"utf8",
-		);
-		renameSync(tmp, sharedMemoryMarkerPath());
+		atomicWriteJson(sharedMemoryMarkerPath(), {
+			...marker,
+			updated_at: new Date().toISOString(),
+			plugin_version: PROVISIONING_PLUGIN_VERSION,
+		});
 	} catch {
 		/* fail-soft — wiring state is re-derived at the next session start */
 	}

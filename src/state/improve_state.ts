@@ -24,9 +24,9 @@
  */
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { piStateDir } from "./helpers";
-import { describeError } from "./helpers/errors";
-import { sha1Hex } from "./helpers/hash";
+import { piStateDir } from "../helpers/paths";
+import { describeError } from "../helpers/errors";
+import { sha1Hex } from "../helpers/hash";
 
 /** Reference default (COGNEE_IMPROVE_COOLDOWN = 1800 s), pi keeps its _MS name. */
 export const DEFAULT_IMPROVE_COOLDOWN_MS = 1_800_000;
