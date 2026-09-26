@@ -1,6 +1,6 @@
 {
 	"name": "@hasanabuzayed/pi-cognee",
-	"version": "0.6.0",
+	"version": "0.7.0",
 	"description": "Cognee persistent memory for the pi coding agent — native extension with auto-capture, auto-recall, and knowledge-graph tools. Fail-soft by design: pi keeps working when the cognee server is down.",
 	"license": "MIT",
 	"main": "src/index.ts",

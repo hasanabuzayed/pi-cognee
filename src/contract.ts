@@ -31,7 +31,7 @@ export const AGENT_ROLE_NAME = "cognee-agent";
  * (server-side fixes ship with plugin bumps — reference parity). Keep in sync
  * with package.json until the release commit pins both.
  */
-export const PROVISIONING_PLUGIN_VERSION = "0.6.0";
+export const PROVISIONING_PLUGIN_VERSION = "0.7.0";
 
 /** A denied grant is retried after this window (reference _GRANT_DENIED_RETRY_SECONDS). */
 export const GRANT_DENIED_RETRY_SECONDS = 3600;
