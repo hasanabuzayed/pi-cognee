@@ -87,18 +87,9 @@ export interface QaEntry {
 	context?: string;
 }
 
-/** OpenAPI TraceEntry (type "trace") — one captured tool call (reference
- *  `_store_tool_call`; memory_query / memory_context stay server-defaulted
- *  because the reference never populates them). */
-export interface TraceEntry {
-	type: "trace";
-	origin_function: string;
-	status: "success" | "error";
-	method_params: Record<string, string>;
-	method_return_value: string;
-	error_message: string;
-	generate_feedback_with_llm: boolean;
-}
+/** OpenAPI TraceEntry moved to helpers/tracing (next to buildTraceEntry) —
+ *  re-exported here for compatibility with client-side consumers. */
+export type { TraceEntry } from "../helpers/tracing";
 
 export type ImproveOutcome = "ok" | "busy" | "unsupported" | "error";
 

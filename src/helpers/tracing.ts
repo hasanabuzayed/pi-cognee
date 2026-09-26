@@ -1,4 +1,3 @@
-import type { TraceEntry } from "../client/types";
 import { DENY_PATHS, PATH_KEYS } from "../constants";
 import type { CapturePolicy, RedactOptions, ToolResultLike } from "./types";
 
@@ -15,6 +14,38 @@ import type { CapturePolicy, RedactOptions, ToolResultLike } from "./types";
 export const TRACE_MAX_PARAM_BYTES = 4000;
 export const TRACE_MAX_RETURN_BYTES = 8000;
 export const TRACE_MAX_ERROR_BYTES = 500;
+
+/** OpenAPI TraceEntry (type "trace") — one captured tool call (reference
+ *  `_store_tool_call`; memory_query / memory_context stay server-defaulted
+ *  because the reference never populates them). Lives here next to its
+ *  constructor; client/types.ts re-exports for compatibility. */
+export interface TraceEntry {
+	type: "trace";
+	origin_function: string;
+	status: "success" | "error";
+	method_params: Record<string, string>;
+	method_return_value: string;
+	error_message: string;
+	generate_feedback_with_llm: boolean;
+}
+
+/** Local-mode quickstart servers live on the loopback interface. Same predicate as the
+ *  official plugins' service_url_is_local: consent for auto-index = the code never
+ *  leaves this machine, which is a property of the URL host, not the backend label.
+ *  Capture/consent policy lives with the rest of it, here. */
+export function isLoopbackUrl(baseUrl: string): boolean {
+	try {
+		const host = new URL(baseUrl).hostname;
+		return (
+			host === "localhost" ||
+			host === "127.0.0.1" ||
+			host === "::1" ||
+			host === "0.0.0.0"
+		);
+	} catch {
+		return false;
+	}
+}
 
 /** json.dumps(default=str) analog for non-string param values: custom tool
  *  inputs can hold non-JSON-safe values (functions, bigints) — fall back to

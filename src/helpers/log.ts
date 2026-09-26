@@ -6,7 +6,7 @@ import {
 	unlinkSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { piStateDir } from "./index";
+import { piStateDir } from "./paths";
 
 /** Rotation cap for plugin event logs — env override, 20 MiB default. */
 export function pluginLogMaxBytes(): number {

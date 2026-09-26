@@ -12,7 +12,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { CODE_EXTENSIONS } from "../constants";
-import { sha256Hex } from ".";
+import { sha256Hex } from "./hash";
 import { CodeRepoState } from "./types";
 
 const execFileAsync = promisify(execFile);

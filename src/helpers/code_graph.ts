@@ -1,5 +1,5 @@
 import { CODE_EXTENSIONS } from "../constants";
-import { sha256Hex } from ".";
+import { sha256Hex } from "./hash";
 import { canonicalRepoSpec, readableTail } from "./git";
 
 /* ------------------------------------------------------------------ */

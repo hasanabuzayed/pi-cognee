@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { piStateDir } from "./index";
+import { piStateDir } from "./paths";
 
 /* ----- Circuit breaker (recall path) ----- */
 // File-shared like the official plugins: the in-memory window stays the fast

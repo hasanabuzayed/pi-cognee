@@ -7,7 +7,7 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PROVISIONING_PLUGIN_VERSION, type SharedMemoryMarker } from "../provisioning";
-import { piStateDir } from ".";
+import { piStateDir } from "./paths";
 
 export function sharedMemoryMarkerPath(): string {
 	return join(piStateDir(), "shared-memory.json");

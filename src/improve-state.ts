@@ -22,11 +22,11 @@
  * Pure functions over piStateDir() (~/.cognee-plugin/pi, COGNEE_PI_STATE_DIR
  * honored): no timers, no spawns, all IO fail-soft with atomic writes.
  */
-import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { piStateDir } from "./helpers";
 import { describeError } from "./helpers/errors";
+import { sha1Hex } from "./helpers/hash";
 
 /** Reference default (COGNEE_IMPROVE_COOLDOWN = 1800 s), pi keeps its _MS name. */
 export const DEFAULT_IMPROVE_COOLDOWN_MS = 1_800_000;
@@ -45,10 +45,6 @@ export interface ImproveState {
   last_failure_reason?: string;
   last_failure_trigger?: string;
   failure_count?: number;
-}
-
-function sha1Hex(value: string): string {
-  return createHash("sha1").update(value, "utf8").digest("hex");
 }
 
 /** <stateDir>/improve-state/<sha1(sessionId)>.json */
